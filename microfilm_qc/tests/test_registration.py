@@ -9,6 +9,7 @@
 """
 import csv
 import io
+import json
 import os
 import sys
 import tempfile
@@ -221,6 +222,48 @@ class RegistrationFlowTests(unittest.TestCase):
         self.assertEqual(out["reg"]["dx_full"], dx)
         self.assertEqual(out["reg"]["dy_full"], dy)
         self.assertTrue(out["reg"]["manual"])
+
+    def test_manual_recompute_reads_public_dx_dy_fields(self):
+        # 公开契约：manual=true 提交 rotation/dx/dy，配准层必须收到并持久化 (90, 17, -9)，
+        # 不能静默丢成 (90, 0, 0)，也不能重新搜索覆盖位移。
+        it = self._item(33)
+        rotation, dx, dy = 90, 17, -9
+        r = self.c.post("/api/rescan-items/%d/registration" % it["id"],
+                        json={"manual": True, "rotation": rotation,
+                              "dx": dx, "dy": dy})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        reg = r.get_json()["registration"]
+        self.assertFalse(reg["auto"])
+        self.assertEqual(reg["rotation"], rotation)
+        self.assertEqual(reg["dx_full"], dx)
+        self.assertEqual(reg["dy_full"], dy)
+        # 落库后的详情（持久化）一致
+        out = next(x for x in r.get_json()["detail"]["items"] if x["id"] == it["id"])
+        self.assertEqual(out["reg"]["rotation"], rotation)
+        self.assertEqual(out["reg"]["dx_full"], dx)
+        self.assertEqual(out["reg"]["dy_full"], dy)
+        self.assertTrue(out["reg"]["manual"])
+        # 直接查库核对保存的是公开字段值，而非 0
+        row = app.db.one(
+            "SELECT reg_status, reg_detail, reg_manual FROM rescan_items WHERE id=?",
+            (it["id"],))
+        self.assertEqual(row["reg_manual"], 1)
+        detail = json.loads(row["reg_detail"])
+        self.assertEqual((detail["rotation"], detail["dx_full"], detail["dy_full"]),
+                         (rotation, dx, dy))
+
+    def test_manual_recompute_nonzero_translation_changes_metric(self):
+        # 同条目在 0 位移给出基准 IoU；提交非零公开位移后必须反映该位移，
+        # 证明 dx/dy 确实传到了配准层（而不是被忽略成 0）。
+        it = self._item(33)
+        base = self.c.post("/api/rescan-items/%d/registration" % it["id"],
+                           json={"manual": True, "rotation": 0, "dx": 0, "dy": 0})
+        base_iou = base.get_json()["registration"]["iou"]
+        moved = self.c.post("/api/rescan-items/%d/registration" % it["id"],
+                            json={"manual": True, "rotation": 0, "dx": 17, "dy": -9})
+        moved_reg = moved.get_json()["registration"]
+        self.assertEqual((moved_reg["dx_full"], moved_reg["dy_full"]), (17, -9))
+        self.assertNotAlmostEqual(moved_reg["iou"], base_iou, places=3)
 
     def test_undo_accept_keeps_registration_record(self):
         it = self._item(20)

@@ -757,10 +757,18 @@ def rescan_recompute_registration(item_id):
     if it["status"] in ("accepted", "rejected"):
         abort(400, "该条目已处理，核对记录已冻结；如需重新配准请先撤销或改绑")
     if body.get("manual"):
+        # 公开契约：manual=true 时读取 rotation/dx/dy（dx/dy 为原图像素平移）。
+        # 兼容旧前端曾用的 dx_full/dy_full；两者都没有时视为 0。
+        def _field(name, legacy):
+            if body.get(name) is not None:
+                return float(body[name])
+            if body.get(legacy) is not None:
+                return float(body[legacy])
+            return 0
         try:
             rotation = int(body.get("rotation", 0))
-            dx = int(round(float(body.get("dx_full", 0))))
-            dy = int(round(float(body.get("dy_full", 0))))
+            dx = int(round(_field("dx", "dx_full")))
+            dy = int(round(_field("dy", "dy_full")))
         except (TypeError, ValueError):
             abort(400, "旋转/平移参数无效")
         manual = (rotation, dx, dy)

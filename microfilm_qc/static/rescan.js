@@ -381,7 +381,7 @@ async function rbRecompute(card, it, manual = true) {
   if (ui.busy) return;
   ui.busy = true;
   const body = manual && ui.dirty
-    ? {manual: true, rotation: ui.rotation, dx_full: ui.dx_full, dy_full: ui.dy_full}
+    ? {manual: true, rotation: ui.rotation, dx: ui.dx_full, dy: ui.dy_full}
     : {};
   try {
     const j = await post(`/api/rescan-items/${it.id}/registration`, body);
