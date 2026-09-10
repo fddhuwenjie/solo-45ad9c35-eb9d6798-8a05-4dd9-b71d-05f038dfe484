@@ -455,6 +455,17 @@ def boundary_merge_preview(reel_id):
     return send_file(io.BytesIO(data), mimetype="image/jpeg")
 
 
+def _boundary_recheck(reel_id, outputs, extra_boundary):
+    """局部重算参与帧及邻近帧告警；若编号顺延波及窗口之外，则全量重算
+    （远处缺帧/重复告警中的旧帧号需要随顺延更新）。"""
+    local = set(_neighbors(db, reel_id, outputs))
+    far = [fid for fid in (extra_boundary.get("renumber_ids") or []) if fid not in local]
+    if far:
+        analysis.run_checks(db, reel_id)
+    else:
+        analysis.recheck(db, reel_id, outputs + _neighbors(db, reel_id, outputs))
+
+
 @app.route("/api/frame/<int:frame_id>/boundary/split", methods=["POST"])
 def boundary_split(frame_id):
     f = frame_or_404(frame_id)
@@ -480,7 +491,7 @@ def boundary_split(frame_id):
         _boundary_abort_revision(reel_id)
         return jsonify({"error": str(ex), "state": state(reel_id)}), 400
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
-    analysis.recheck(db, reel_id, outputs + _neighbors(db, reel_id, outputs))
+    _boundary_recheck(reel_id, outputs, extra["boundary"])
     db.run("UPDATE revisions SET extra=? WHERE id=?",
            (json.dumps(extra, ensure_ascii=False), rev_id))
     return jsonify({"op_id": op_id, "outputs": outputs, "state": state(reel_id)})
@@ -512,7 +523,7 @@ def boundary_merge(reel_id):
         _boundary_abort_revision(reel_id)
         return jsonify({"error": str(ex), "state": state(reel_id)}), 400
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
-    analysis.recheck(db, reel_id, outputs + _neighbors(db, reel_id, outputs))
+    _boundary_recheck(reel_id, outputs, extra["boundary"])
     db.run("UPDATE revisions SET extra=? WHERE id=?",
            (json.dumps(extra, ensure_ascii=False), rev_id))
     return jsonify({"op_id": op_id, "outputs": outputs, "state": state(reel_id)})

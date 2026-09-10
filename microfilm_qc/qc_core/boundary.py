@@ -491,28 +491,109 @@ def _boundary_dir(root, reel_id):
     return d
 
 
-def _renumber_numeric_block(frames, anchor_pos):
-    """把包含锚点位置的连续数字帧号块，从块内最小号开始重新编号。
-    返回 {frame_id: new_frame_no}（仅变化项）。非数字帧号（如 37A）自然断块。"""
-    blocks, cur = [], []
-    for f in sorted(frames, key=lambda f: f["position"]):
-        if _num(f["frame_no"]) is not None:
-            cur.append(f)
-        else:
-            if cur:
-                blocks.append(cur)
-            cur = []
-    if cur:
-        blocks.append(cur)
-    block = next((b for b in blocks if any(f["position"] == anchor_pos for f in b)), None)
-    if not block:
-        return {}
-    start = min(_num(f["frame_no"]) for f in block)
+_SUFFIX_RE = re.compile(r"^(\d+)([a-z]+)$")
+
+
+def _no_core(frame_no):
+    """帧号分类。返回 (数字核, 小写后缀, 是否可参与顺延)。
+    纯数字与“数字+小写后缀”（系统衍生的半页号，如 17b）参与顺延；
+    大写后缀（人工占位，如 37A）与完全非数字帧号不动。"""
+    s = str(frame_no or "")
+    if s.isdigit():
+        return int(s), "", True
+    m = _SUFFIX_RE.match(s)
+    if m:
+        return int(m.group(1)), m.group(2), True
+    return None, None, False
+
+
+def _next_suffix(frame_nos, base_no):
+    """非数字锚点拆分时，为新增片段生成 a/b/c… 小写后缀，跳过已占用编号。"""
+    used = {str(x) for x in frame_nos}
+    for i in range(26):
+        cand = "%s%s" % (base_no, chr(ord("a") + i))
+        if cand not in used:
+            used.add(cand)
+            return cand
+    raise ValueError("同号衍生帧过多（a-z 已用尽），请人工编号")
+
+
+def _assert_numbering(frames, changed):
+    """校验重编号结果：无空号、无重号（否则中止本次修订）。"""
+    labels, empties = [], 0
+    for f in frames:
+        no = changed.get(f["id"], str(f["frame_no"]))
+        if not str(no or "").strip():
+            empties += 1
+        labels.append(str(no))
+    if empties:
+        raise ValueError("重编号失败：存在 %d 个未编号帧，请人工核查帧号序列" % empties)
+    dup = {x for x in labels if labels.count(x) > 1}
+    if dup:
+        raise ValueError("重编号失败：顺延会产生重复帧号 %s，请人工核查" % "、".join(sorted(dup)))
+
+
+def _renumber_after_split(frames, anchor_pos, output_count, filled, new_frame_ids):
+    """拆分后的定向顺延编号，返回 {frame_id: new_frame_no}。
+
+    锚点保留原号 n；filled 个片段就地填充紧随的缺帧占位（沿用其既有编号）；
+    新增的 K=output_count-1-filled 个片段依次取 n+filled+1 … n+filled+K；
+    其后数字核 >= n+filled+1 的数字帧/小写衍生帧整体 +K 顺延，其余帧号不动。"""
+    ordered = sorted(frames, key=lambda f: f["position"])
+    anchor = next(f for f in ordered if f["position"] == anchor_pos)
     changed = {}
-    for i, f in enumerate(block):
-        new_no = str(start + i)
-        if new_no != str(f["frame_no"]):
-            changed[f["id"]] = new_no
+    n = _num(anchor["frame_no"])
+    new_ids = set(new_frame_ids)
+
+    if n is None:
+        # 锚点本身非纯数字（如 37A）：新增片段取同核小写后缀，不顺延数字序列
+        used = [f["frame_no"] for f in ordered]
+        for f in ordered:
+            if f["id"] in new_ids:
+                cand = _next_suffix(used, anchor["frame_no"])
+                changed[f["id"]] = cand
+                used.append(cand)
+        _assert_numbering(ordered, changed)
+        return changed
+
+    k = output_count - 1 - filled
+    # 1) 新增片段按输出段中的先后连续编号（先给号，避免顺延撞上其临时空号）
+    new_in_order = [f for f in ordered if f["id"] in new_ids]
+    for j, f in enumerate(new_in_order):
+        changed[f["id"]] = str(n + filled + j + 1)
+    # 2) 其余既有帧：数字核 >= 新增片段首号者整体 +K 顺延
+    #    （纯数字/小写衍生参与；大写后缀人工占位与完全非数字帧不动）
+    if k:
+        threshold = n + filled + 1
+        for f in ordered:
+            if f["id"] in new_ids or f["position"] <= anchor_pos:
+                continue
+            core, suffix, shiftable = _no_core(f["frame_no"])
+            if shiftable and core >= threshold:
+                changed[f["id"]] = str(core + k) + suffix
+    _assert_numbering(ordered, changed)
+    return changed
+
+
+def _renumber_after_merge(frames, anchor_pos, removed_nos):
+    """合并后的定向顺延编号，返回 {frame_id: new_frame_no}。
+
+    锚点保留原号；被移除帧中纯数字帧的个数为 D（小写衍生半页如 17b 不占数字号），
+    其后数字核足够大的数字帧/小写衍生帧整体 -D 回退。"""
+    ordered = sorted(frames, key=lambda f: f["position"])
+    anchor = next(f for f in ordered if f["position"] == anchor_pos)
+    n = _num(anchor["frame_no"])
+    d = sum(1 for x in removed_nos if _num(x) is not None)
+    changed = {}
+    if n is not None and d:
+        threshold = n + d + 1
+        for f in ordered:
+            if f["position"] <= anchor_pos:
+                continue
+            core, suffix, shiftable = _no_core(f["frame_no"])
+            if shiftable and core >= threshold:
+                changed[f["id"]] = str(core - d) + suffix
+    _assert_numbering(ordered, changed)
     return changed
 
 
@@ -574,26 +655,39 @@ def split_frame(db, root, reel_id, frame_id, cuts, reason="", op_id=None):
     db.add_version(frame_id, reel_id, "boundary", os.path.basename(anchor_path), anchor_path,
                    source="帧边界拆分（第 1/%d 段）" % len(paths), op_id=op_id, is_current=1)
 
-    # 第 2..k 段：先填充锚点之后连续的缺帧占位，再新增帧
+    # 第 2..k 段的位置安排：锚点之后需要 len(paths)-1 个连续位置。
+    # 紧随锚点的缺帧占位（在导入时就对应粘连图内缺失页）就地补图；不足部分新增帧。
+    # 先为新增片段腾位，再让占位帧落到其目标位置，保证输出段在胶片带上连续。
+    n_seg = len(paths) - 1
     frames_now = db.frames(reel_id)
     anchor_pos = next(x["position"] for x in frames_now if x["id"] == frame_id)
-    after = sorted((x for x in frames_now if x["position"] > anchor_pos),
-                   key=lambda x: x["position"])
+    trailing = sorted((x for x in frames_now if x["position"] > anchor_pos),
+                      key=lambda x: x["position"])
     placeholders = []
-    for x in after:
+    for x in trailing:
         if x["placeholder"]:
             placeholders.append(x)
         else:
             break
+    n_fill = min(n_seg, len(placeholders))
+    n_new = n_seg - n_fill
 
+    # 1) 锚点之后所有帧后移 n_new 位，给新增片段腾出连续位置
+    if n_new:
+        db.run("UPDATE frames SET position=position+? WHERE reel_id=? AND position>?",
+               (n_new, reel_id, anchor_pos))
+
+    # 2) 目标位置 -> 片段：第 2..n_fill+1 段填充占位，其余为新增
     output_ids = [frame_id]
     new_frame_ids, filled_ids = [], []
-    ins_at = anchor_pos
-    for k in range(1, len(paths)):
-        path = paths[k]
+    for seg_i in range(1, n_seg + 1):
+        target_pos = anchor_pos + seg_i
+        path = paths[seg_i]
         fp = imaging.fingerprint(path)
-        ph = placeholders[k - 1] if k - 1 < len(placeholders) else None
+        ph = placeholders[seg_i - 1] if seg_i - 1 < n_fill else None
         if ph:
+            # 占位帧移动到该段的目标位置后补图
+            db.run("UPDATE frames SET position=? WHERE id=?", (target_pos, ph["id"]))
             db.run(
                 """UPDATE frames SET filename=?, stored_path=?, width=?, height=?, phash=?, cvec=?,
                                      brightness=?, ink=?, orient_score=?, rotation=0,
@@ -603,26 +697,24 @@ def split_frame(db, root, reel_id, frame_id, cuts, reason="", op_id=None):
                  (ph["note"] + " " if ph["note"] else "")
                  + "拆分填充自 No.%s" % f["frame_no"], ph["id"]))
             db.add_version(ph["id"], reel_id, "boundary", os.path.basename(path), path,
-                           source="帧边界拆分（第 %d/%d 段，填充缺帧占位）" % (k + 1, len(paths)),
+                           source="帧边界拆分（第 %d/%d 段，填充缺帧占位）" % (seg_i + 1, n_seg + 1),
                            op_id=op_id, is_current=1)
             output_ids.append(ph["id"])
             filled_ids.append(ph["id"])
         else:
-            ins_at += 1
-            db.run("UPDATE frames SET position=position+1 WHERE reel_id=? AND position>=?",
-                   (reel_id, ins_at))
-            nid = db.add_frame(reel_id, position=ins_at, frame_no="",
+            nid = db.add_frame(reel_id, position=target_pos, frame_no="",
                                filename=os.path.basename(path), stored_path=path,
                                note="拆分自 No.%s" % f["frame_no"], placeholder=0, **fp)
             db.add_version(nid, reel_id, "boundary", os.path.basename(path), path,
-                           source="帧边界拆分（第 %d/%d 段）" % (k + 1, len(paths)),
+                           source="帧边界拆分（第 %d/%d 段）" % (seg_i + 1, n_seg + 1),
                            op_id=op_id, is_current=1)
             output_ids.append(nid)
             new_frame_ids.append(nid)
 
     _normalize_positions(db, reel_id)
     anchor2 = db.one("SELECT position FROM frames WHERE id=?", (frame_id,))
-    changed_no = _renumber_numeric_block(db.frames(reel_id), anchor2["position"])
+    changed_no = _renumber_after_split(db.frames(reel_id), anchor2["position"],
+                                       len(output_ids), len(filled_ids), new_frame_ids)
     for fid, no in changed_no.items():
         db.run("UPDATE frames SET frame_no=? WHERE id=?", (no, fid))
 
@@ -647,6 +739,7 @@ def split_frame(db, root, reel_id, frame_id, cuts, reason="", op_id=None):
 
     extra = {"boundary": {"op": "split", "op_id": op_id, "anchor_id": frame_id,
                           "new_frame_ids": new_frame_ids, "filled_placeholders": filled_ids,
+                          "renumber_ids": list(changed_no.keys()),
                           "old_version_id": old_ver["id"] if old_ver else None,
                           "files": paths, "elapsed": round(time.time() - t0, 2)}}
     return frame_id, output_ids, extra, op_id
@@ -729,7 +822,8 @@ def merge_frames(db, root, reel_id, frame_ids, layout=None, reason="", op_id=Non
 
     _normalize_positions(db, reel_id)
     anchor2 = db.one("SELECT position FROM frames WHERE id=?", (anchor["id"],))
-    changed_no = _renumber_numeric_block(db.frames(reel_id), anchor2["position"])
+    changed_no = _renumber_after_merge(db.frames(reel_id), anchor2["position"],
+                                       [x["frame_no"] for x in removed_info])
     for fid, no in changed_no.items():
         db.run("UPDATE frames SET frame_no=? WHERE id=?", (no, fid))
 
@@ -752,6 +846,7 @@ def merge_frames(db, root, reel_id, frame_ids, layout=None, reason="", op_id=Non
 
     extra = {"boundary": {"op": "merge", "op_id": op_id, "anchor_id": anchor["id"],
                           "removed_frame_ids": [f["id"] for f in removed],
+                          "renumber_ids": list(changed_no.keys()),
                           "old_version_id": old_ver["id"] if old_ver else None,
                           "files": [out_path], "elapsed": round(time.time() - t0, 2)}}
     return anchor["id"], [anchor["id"]], extra, op_id

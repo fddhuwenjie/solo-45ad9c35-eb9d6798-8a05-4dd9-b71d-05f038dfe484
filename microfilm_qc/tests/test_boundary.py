@@ -119,20 +119,110 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(os.listdir(bdir), [])
 
     def test_split_inserts_new_frame_when_no_placeholder(self):
-        # 没有后续占位时，拆分应新增一帧并整体重新编号（用 37A 之前的 No.36 不合适，
-        # 直接对一张正常帧加切线也可；选 No.9）
+        """普通帧后没有紧随的缺帧占位：新增片段必须取得连续编号，
+        其后的数字帧/小写衍生半页帧整体顺延，且全卷不得出现空号或重号。"""
         st = self._state()
         f9 = self._frame(st, "9")
+        total_before = len(st["frames"])
         r = self.c.post("/api/frame/%d/boundary/split" % f9["id"],
                         json={"cuts": [{"axis": "x", "pos": 450}]})
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         st2 = r.get_json()["state"]
-        self.assertEqual(len(st2["frames"]), len(st["frames"]) + 1)
-        # No.9 之后的数字帧整体 +1：原 No.10 现在应为 No.11
+        self.assertEqual(len(st2["frames"]), total_before + 1)
+
+        nos = [(f["position"], f["frame_no"]) for f in st2["frames"]]
         pos9 = self._frame(st2, "9")["position"]
-        self.assertEqual(st2["frames"][pos9 + 1]["frame_no"], "10")
+        # 锚点 No.9 不动；新增片段紧随其后取 No.10
+        self.assertEqual(nos[pos9][1], "9")
+        new_seg = st2["frames"][pos9 + 1]
+        self.assertEqual(new_seg["frame_no"], "10")
+        self.assertFalse(new_seg["placeholder"])
+        # 原 No.10..37 整体顺延一号（其位置因插入而后移一位）
+        self.assertEqual(st2["frames"][pos9 + 2]["frame_no"], "11")
         self.assertEqual(self._frame(st2, "11")["filename"],
                          next(f for f in st["frames"] if f["frame_no"] == "10")["filename"])
+        self.assertEqual(self._frame(st2, "38")["filename"],
+                         next(f for f in st["frames"] if f["frame_no"] == "37")["filename"])
+        # 小写衍生半页随数字核顺延：17b -> 18b（与 18 -> 19 对齐）
+        self.assertIsNone(next((f for f in st2["frames"] if f["frame_no"] == "17b"), None))
+        b18 = next(f for f in st2["frames"] if f["frame_no"] == "18b")
+        self.assertTrue(b18["filename"].endswith("0017b.jpg"))
+        # 无空号、无重号
+        labels = [f["frame_no"] for f in st2["frames"]]
+        self.assertEqual(all(x.strip() for x in labels), True)
+        self.assertEqual(len(labels), len(set(labels)))
+
+        # 远处缺帧告警中的帧号同步更新（原缺帧 No.20 -> No.21）
+        missing = [w["frame_no"] for w in st2["warnings"] if w["type"] == "missing"]
+        self.assertIn("21", missing)
+
+        # 移交清单不得出现未编号帧
+        man = self.c.get("/api/reels/%d/export/manifest.json" % self.rid).get_json()
+        self.assertTrue(all(row["frame_no"] for row in man["frames"]))
+
+        # 撤销：编号、位置、半页号恢复
+        u = self.c.post("/api/reels/%d/undo" % self.rid).get_json()["state"]
+        labels = [f["frame_no"] for f in u["frames"]]
+        self.assertEqual(len(u["frames"]), total_before)
+        self.assertIn("17b", labels)
+        self.assertNotIn("18b", labels)
+        self.assertEqual(self._frame(u, "9")["filename"], f9["filename"])
+        self.assertEqual(len(labels), len(set(labels)))
+
+    def test_split_multiple_new_segments_renumber_correctly(self):
+        """一次切成三段（两条切线、无占位）：新增两段取连续号，后续整体 +2 顺延。"""
+        st = self._state()
+        f11 = self._frame(st, "11")
+        r = self.c.post("/api/frame/%d/boundary/split" % f11["id"],
+                        json={"cuts": [{"axis": "x", "pos": 300},
+                                       {"axis": "x", "pos": 600}]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        st2 = r.get_json()["state"]
+        self.assertEqual(len(st2["frames"]), len(st["frames"]) + 2)
+        window = {f["frame_no"] for f in st2["frames"][10:16]}
+        self.assertEqual(window, {"10", "11", "12", "13", "14", "15"})
+        self.assertEqual(self._frame(st2, "11")["filename"][:2], "op")
+        self.assertEqual(self._frame(st2, "12")["filename"][:2], "op")
+        self.assertEqual(self._frame(st2, "13")["filename"][:2], "op")
+        # 原 No.12 -> 14
+        self.assertTrue(self._frame(st2, "14")["filename"].endswith("0012.jpg"))
+        # 17b -> 19b（顺延 2）
+        self.assertIsNotNone(next((f for f in st2["frames"] if f["frame_no"] == "19b"), None))
+        labels = [f["frame_no"] for f in st2["frames"]]
+        self.assertTrue(all(labels))
+        self.assertEqual(len(labels), len(set(labels)))
+
+    def test_split_new_segment_then_fill_placeholder_chain(self):
+        """先在无占位处拆分（占位 No.20 被顺延到 No.21），再拆分粘连 No.7，
+        其第二片段应填充紧随其后的 No.8 占位，编号不发生二次顺延。"""
+        # 先拆 No.9（+1 顺延）
+        st = self._state()
+        f9 = self._frame(st, "9")
+        r = self.c.post("/api/frame/%d/boundary/split" % f9["id"],
+                        json={"cuts": [{"axis": "x", "pos": 450}]})
+        self.assertEqual(r.status_code, 200)
+        # 再拆 No.7：第二片段填充 No.8 占位（该占位位置紧随 No.7，不受顺延影响）
+        st = r.get_json()["state"]
+        f7 = self._frame(st, "7")
+        cand = self._candidates()
+        cut = next(s for s in cand["splits"] if s["frame_no"] == "7")["cuts"]
+        r = self.c.post("/api/frame/%d/boundary/split" % f7["id"], json={"cuts": cut})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        st2 = r.get_json()["state"]
+        f8 = self._frame(st2, "8")
+        self.assertFalse(f8["placeholder"])
+        self.assertEqual(f8["boundary"]["kind"], "crop")
+        # 两个拆分操作均在案
+        self.assertEqual(len(st2["boundary_ops"]), 2)
+        labels = [f["frame_no"] for f in st2["frames"]]
+        self.assertTrue(all(labels))
+        self.assertEqual(len(labels), len(set(labels)))
+        # 逐层撤销恢复
+        self.c.post("/api/reels/%d/undo" % self.rid)
+        u = self.c.post("/api/reels/%d/undo" % self.rid).get_json()["state"]
+        self.assertTrue(self._frame(u, "8")["placeholder"])
+        self.assertEqual(self._frame(u, "7")["width"], 1846)
+        self.assertEqual(len(u["boundary_ops"]), 0)
 
     # ---- 拦截 ----
     def test_split_intercepts_zero_width_and_crossing(self):
@@ -211,6 +301,32 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(len(st3["frames"]), len(st["frames"]))
         self.assertIsNotNone(next((f for f in st3["frames"] if f["frame_no"] == "17b"), None))
         self.assertEqual(self._frame(st3, "17")["width"], 900)
+
+    def test_merge_numeric_pair_rolls_back_later_numbers(self):
+        """合并两个连续纯数字帧（占两个号）：锚点保留原号，其后纯数字帧 -1 回退，
+        小写衍生半页随核回退；撤销后全部恢复。"""
+        st = self._state()
+        # 选尾部两个连续实体帧 No.35 / No.36（35 为 .jpg、36 为 .jpg，同卷）
+        f35 = self._frame(st, "35")
+        f36 = self._frame(st, "36")
+        r = self.c.post("/api/reels/%d/boundary/merge" % self.rid,
+                        json={"frame_ids": [f35["id"], f36["id"]]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        st2 = r.get_json()["state"]
+        self.assertEqual(len(st2["frames"]), len(st["frames"]) - 1)
+        # 原片尾 No.37（trailer）回退为 36
+        trailer = st2["frames"][-1]
+        self.assertEqual(trailer["frame_no"], "36")
+        self.assertIn("trailer", trailer["filename"])
+        # 锚点仍是 35；编号无空号无重号
+        self.assertEqual(self._frame(st2, "35")["boundary"]["kind"], "stitch")
+        labels = [f["frame_no"] for f in st2["frames"]]
+        self.assertTrue(all(labels))
+        self.assertEqual(len(labels), len(set(labels)))
+
+        u = self.c.post("/api/reels/%d/undo" % self.rid).get_json()["state"]
+        self.assertEqual(self._frame(u, "36")["filename"], f36["filename"])
+        self.assertEqual(u["frames"][-1]["frame_no"], "37")
 
     # ---- 预览 ----
     def test_previews(self):
