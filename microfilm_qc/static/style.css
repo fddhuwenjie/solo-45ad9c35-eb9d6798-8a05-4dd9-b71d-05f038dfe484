@@ -97,6 +97,11 @@ button.ghost { background: transparent; }
 }
 .frame.drop-before { box-shadow: -6px 0 0 0 var(--accent); }
 .frame.drop-after { box-shadow: 6px 0 0 0 var(--accent); }
+.frame .rbmark {
+  position: absolute; top: 2px; left: 2px;
+  background: var(--ok); color: #10210f; font-size: 10px;
+  padding: 1px 5px; border-radius: 3px; font-weight: 700;
+}
 
 /* 告警 */
 .columns { display: grid; grid-template-columns: 1fr 1.2fr; gap: 0; }
@@ -145,3 +150,55 @@ button.ghost { background: transparent; }
   box-shadow: 0 4px 18px rgba(0,0,0,.5);
 }
 .toast.err { border-color: var(--danger); }
+
+/* ---------------- 补扫回填 ---------------- */
+.rescan-panel { margin-bottom: 30px; }
+.rescan-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.rescan-head h3 { margin: 0; }
+.badge.gray { background: var(--panel2); color: var(--muted); border: 1px solid var(--border); }
+.rescan-form { margin: 10px 0; padding-top: 10px; border-top: 1px solid var(--border); }
+.rb-batchbar { display: flex; gap: 10px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+.rb-batchbar select { min-width: 320px; }
+.rb-filters { display: flex; gap: 6px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+.rb-filters #rbUnused { margin-left: 10px; }
+.rb-tab { padding: 3px 12px; font-size: 12px; }
+.rb-tab.active { border-color: var(--accent); color: var(--accent); }
+.rb-items { display: flex; flex-direction: column; gap: 10px; }
+.rb-card {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel2); padding: 10px 12px;
+}
+.rb-card.rb-blocked { border-left: 3px solid var(--danger); }
+.rb-card.rb-accepted { border-left: 3px solid var(--ok); opacity: .92; }
+.rb-card.rb-rejected { border-left: 3px solid var(--muted); opacity: .7; }
+.rb-card-head { display: flex; gap: 10px; align-items: baseline; margin-bottom: 8px; flex-wrap: wrap; }
+.rb-seq { color: var(--muted); font-size: 12px; }
+.rb-target { font-weight: 600; }
+.rb-file { color: var(--muted); font-size: 12px; font-family: monospace;
+           max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rb-status { margin-left: auto; font-size: 11px; padding: 2px 10px; border-radius: 10px;
+             border: 1px solid var(--border); }
+.st-pending { color: var(--warn); border-color: var(--warn) !important; }
+.st-blocked { color: var(--danger); border-color: var(--danger) !important; }
+.st-accepted { color: var(--ok); border-color: var(--ok) !important; }
+.st-rejected { color: var(--muted); }
+.rb-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; position: relative; }
+.rb-sides figure { margin: 0; text-align: center; }
+.rb-sides figcaption { font-size: 12px; color: var(--muted); padding-bottom: 4px; }
+.rb-sides img { width: 100%; max-height: 420px; object-fit: contain; background: #000; border-radius: 4px; }
+.rb-noimg { height: 200px; display: flex; align-items: center; justify-content: center;
+           color: var(--danger); border: 1px dashed var(--danger); border-radius: 4px;
+           background: rgba(212,90,74,.06); }
+.rb-meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.rb-cont { font-size: 12px; color: var(--text); margin: 8px 2px; display: flex; gap: 14px; flex-wrap: wrap; }
+.rb-cont .good { color: var(--ok); }
+.rb-cont .bad { color: var(--danger); }
+.rb-cont .warn { color: var(--warn); }
+.rb-cont i { color: var(--muted); font-style: normal; }
+.rb-reason { color: var(--danger); font-size: 13px; background: rgba(212,90,74,.08);
+             border-radius: 6px; padding: 6px 10px; margin: 6px 0; }
+.rb-note { color: var(--muted); font-size: 12px; margin: 4px 2px; }
+.rb-ops { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.rb-done { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+           pointer-events: none; color: var(--ok); font-size: 15px; text-shadow: 0 1px 4px #000; }
+@media (max-width: 900px) { .rb-sides { grid-template-columns: 1fr; } }

@@ -10,19 +10,24 @@ import zipfile
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
 from qc_core.db import DB
-from qc_core import analysis, imaging, sample_reel
+from qc_core import analysis, imaging, rescan, sample_reel
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
 FRAMES_DIR = os.path.join(DATA, "frames")
+RESCAN_DIR = os.path.join(DATA, "rescan")
 EXPORT_DIR = os.path.join(DATA, "exports")
 os.makedirs(FRAMES_DIR, exist_ok=True)
+os.makedirs(RESCAN_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 app = Flask(__name__)
 db = DB(os.path.join(DATA, "qc.db"))
 
 IMG_EXT = {".tif", ".tiff", ".jpg", ".jpeg"}
+
+# 为升级前已存在的帧补建原始版本记录（来源关系）
+rescan.seed_original_versions(db)
 
 
 # ---------------------------------------------------------------- 工具
@@ -97,9 +102,11 @@ def import_reel(name, reel_no, zip_bytes, manifest_entries):
         with open(stored, "wb") as fh:
             fh.write(zf.read(info))
         fp = imaging.fingerprint(stored)
-        db.add_frame(reel_id, position=position, frame_no=entry["frame_no"],
-                     filename=os.path.basename(info.filename), stored_path=stored,
-                     note=entry.get("note", ""), **fp)
+        fid = db.add_frame(reel_id, position=position, frame_no=entry["frame_no"],
+                           filename=os.path.basename(info.filename), stored_path=stored,
+                           note=entry.get("note", ""), **fp)
+        db.add_version(fid, reel_id, "original", os.path.basename(info.filename), stored,
+                       source="初次导入", is_current=1)
         used.add(fname_zip)
         position += 1
 
@@ -135,11 +142,21 @@ def import_reel(name, reel_no, zip_bytes, manifest_entries):
 
 def state(reel_id):
     reel = reel_or_404(reel_id)
+    versions = db.q(
+        "SELECT frame_id, kind, source FROM frame_versions WHERE reel_id=? AND is_current=1",
+        (reel_id,))
+    vsrc = {v["frame_id"]: {"kind": v["kind"], "source": v["source"]} for v in versions}
+    n_versions = {r["frame_id"]: r["n"] for r in db.q(
+        "SELECT frame_id, COUNT(*) n FROM frame_versions WHERE reel_id=? GROUP BY frame_id",
+        (reel_id,))}
     frames = []
     for f in db.frames(reel_id):
         d = {k: f[k] for k in ("id", "position", "frame_no", "filename", "note",
                                "brightness", "orient_score", "rotation",
                                "excluded", "placeholder", "reshoot")}
+        d["source"] = vsrc.get(f["id"], {}).get("source", "")
+        d["version_kind"] = vsrc.get(f["id"], {}).get("kind", "")
+        d["version_count"] = n_versions.get(f["id"], 0)
         frames.append(d)
     warnings = [dict(w) for w in db.q(
         "SELECT * FROM warnings WHERE reel_id=? ORDER BY resolved, id", (reel_id,))]
@@ -149,6 +166,7 @@ def state(reel_id):
         "frames": frames,
         "warnings": warnings,
         "can_undo": len(db.revisions(reel_id)) > 0,
+        "rescan_batches": rescan.list_batches(db, reel_id),
         "checks": analysis.finalization_checks(db, reel_id),
     }
 
@@ -161,6 +179,35 @@ def mutate(reel_id, action, fn):
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     analysis.run_checks(db, reel_id)
     return jsonify(state(reel_id))
+
+
+def rollback_rescan(extra):
+    """撤销时回滚补扫条目/版本状态（帧字段已由快照还原）。"""
+    for op in extra.get("rescan", []):
+        item = db.one("SELECT * FROM rescan_items WHERE id=?", (op["item_id"],))
+        if not item:
+            continue
+        if op["op"] == "accept":
+            db.run("UPDATE rescan_items SET status='pending', decision_note='', decided_at=0 WHERE id=?",
+                   (op["item_id"],))
+            # 新版本失效，原版本（若有）恢复当前
+            db.run("""UPDATE frame_versions SET is_current=0
+                      WHERE frame_id=? AND item_id=?""",
+                   (op["frame_id"], op["item_id"]))
+            if op.get("old_version_id"):
+                db.run("UPDATE frame_versions SET is_current=1 WHERE id=?",
+                       (op["old_version_id"],))
+        elif op["op"] == "decide":
+            old_target = op.get("old_target_frame_id")
+            db.run("UPDATE rescan_items SET status=?, block_reason=?, decision_note=?, decided_at=0 WHERE id=?",
+                   (op["status"], op.get("block_reason", ""),
+                    op.get("decision_note", ""), op["item_id"]))
+            if old_target is not None:
+                db.run("UPDATE rescan_items SET target_frame_id=? WHERE id=?",
+                       (old_target, op["item_id"]))
+            if op.get("old_frame_no"):
+                db.run("UPDATE rescan_items SET frame_no=? WHERE id=?",
+                       (op["old_frame_no"], op["item_id"]))
 
 
 # ---------------------------------------------------------------- 页面与卷盘
@@ -211,7 +258,9 @@ def delete_reel(reel_id):
     reel_or_404(reel_id)
     db.run("DELETE FROM warnings WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM revisions WHERE reel_id=?", (reel_id,))
+    db.run("DELETE FROM frame_versions WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM frames WHERE reel_id=?", (reel_id,))
+    db.run("DELETE FROM rescan_batches WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM reels WHERE id=?", (reel_id,))
     return jsonify({"ok": True})
 
@@ -347,12 +396,14 @@ def resolve_warning(warning_id):
 @app.route("/api/reels/<int:reel_id>/undo", methods=["POST"])
 def undo(reel_id):
     reel_or_404(reel_id)
-    action = db.undo(reel_id)
-    if action is None:
+    result = db.undo(reel_id)
+    if result is None:
         return jsonify({"error": "没有可撤销的操作", "state": state(reel_id)}), 400
+    if result.get("extra"):
+        rollback_rescan(result["extra"])
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     analysis.run_checks(db, reel_id)
-    return jsonify({"undone": action, "state": state(reel_id)})
+    return jsonify({"undone": result["action"], "state": state(reel_id)})
 
 
 @app.route("/api/reels/<int:reel_id>/finalize", methods=["POST"])
@@ -365,12 +416,185 @@ def finalize(reel_id):
     return jsonify(state(reel_id))
 
 
+# ---------------------------------------------------------------- 补扫回填
+
+def _rescan_batch_or_404(batch_id, reel_id=None):
+    b = db.one("SELECT * FROM rescan_batches WHERE id=?", (batch_id,))
+    if not b or (reel_id is not None and b["reel_id"] != reel_id):
+        abort(404, "补扫批次不存在")
+    return b
+
+
+@app.route("/api/reels/<int:reel_id>/rescans")
+def rescan_batches(reel_id):
+    reel_or_404(reel_id)
+    return jsonify(rescan.list_batches(db, reel_id))
+
+
+@app.route("/api/reels/<int:reel_id>/rescans/import", methods=["POST"])
+def rescan_import(reel_id):
+    reel = reel_or_404(reel_id)
+    zf = request.files.get("zip")
+    if not zf:
+        abort(400, "请上传补扫 ZIP")
+    manifest = request.files.get("manifest")
+    if not manifest:
+        abort(400, "请上传包含卷号、原帧号、文件名的回填清单 CSV/JSON")
+    entries = rescan.parse_backfill_manifest(manifest.read().decode("utf-8-sig", "ignore"))
+    if not entries:
+        abort(400, "回填清单为空或无法解析（需要 reel_no, frame_no, filename 列）")
+    name = request.form.get("name") or os.path.splitext(zf.filename)[0] or ("补扫批次-%s" % reel["reel_no"])
+    note = request.form.get("note", "")
+    batch_id = rescan.import_batch(db, DATA, reel_id, reel["reel_no"], name,
+                                   zf.read(), entries, note=note)
+    detail = rescan.batch_detail(db, batch_id)
+    return jsonify({"batch_id": batch_id, "detail": detail, "state": state(reel_id)})
+
+
+@app.route("/api/rescans/<int:batch_id>")
+def rescan_detail(batch_id):
+    _rescan_batch_or_404(batch_id)
+    detail = rescan.batch_detail(db, batch_id)
+    if detail is None:
+        abort(404)
+    return jsonify(detail)
+
+
+@app.route("/api/rescan-items/<int:item_id>/accept", methods=["POST"])
+def rescan_accept(item_id):
+    it = db.one("SELECT * FROM rescan_items WHERE id=?", (item_id,))
+    if not it:
+        abort(404, "条目不存在")
+    b = _rescan_batch_or_404(it["batch_id"])
+    body = request.get_json(force=True, silent=True) or {}
+    note = body.get("note", "")
+    db.save_revision(b["reel_id"], "接受补扫回填 No.%s" % it["frame_no"])
+    try:
+        reel_id, frame_id, extra = rescan.accept_item(db, item_id, note=note)
+    except ValueError as ex:
+        db.run("DELETE FROM revisions WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
+               (b["reel_id"],))
+        return jsonify({"error": str(ex),
+                        "detail": rescan.batch_detail(db, it["batch_id"])}), 400
+    db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
+    analysis.recheck(db, reel_id, [frame_id])
+    # 把补扫回滚信息并入刚保存的修订
+    db.run("UPDATE revisions SET extra=? WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
+           (json.dumps(extra, ensure_ascii=False), reel_id))
+    return jsonify({"detail": rescan.batch_detail(db, it["batch_id"]),
+                    "state": state(reel_id)})
+
+
+@app.route("/api/rescan-items/<int:item_id>/reject", methods=["POST"])
+def rescan_reject(item_id):
+    it = db.one("SELECT * FROM rescan_items WHERE id=?", (item_id,))
+    if not it:
+        abort(404, "条目不存在")
+    b = _rescan_batch_or_404(it["batch_id"])
+    body = request.get_json(force=True, silent=True) or {}
+    note = body.get("note", "")
+    db.save_revision(b["reel_id"], "拒绝补扫条目 No.%s" % it["frame_no"])
+    reel_id, _fid, extra = rescan.reject_item(db, item_id, note=note)
+    db.run("UPDATE revisions SET extra=? WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
+           (json.dumps(extra, ensure_ascii=False), reel_id))
+    return jsonify({"detail": rescan.batch_detail(db, it["batch_id"]),
+                    "state": state(reel_id)})
+
+
+@app.route("/api/rescan-items/<int:item_id>/rebind", methods=["POST"])
+def rescan_rebind(item_id):
+    it = db.one("SELECT * FROM rescan_items WHERE id=?", (item_id,))
+    if not it:
+        abort(404, "条目不存在")
+    b = _rescan_batch_or_404(it["batch_id"])
+    body = request.get_json(force=True)
+    new_no = str(body.get("frame_no", "")).strip()
+    if not new_no:
+        abort(400, "请提供改绑目标帧号")
+    note = body.get("note", "改绑 No.%s → No.%s" % (it["frame_no"], new_no))
+    db.save_revision(b["reel_id"], "补扫改绑 No.%s → No.%s" % (it["frame_no"], new_no))
+    try:
+        reel_id, _fid, extra = rescan.rebind_item(db, item_id, new_no, note=note)
+    except ValueError as ex:
+        db.run("DELETE FROM revisions WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
+               (b["reel_id"],))
+        return jsonify({"error": str(ex),
+                        "detail": rescan.batch_detail(db, it["batch_id"])}), 400
+    db.run("UPDATE revisions SET extra=? WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
+           (json.dumps(extra, ensure_ascii=False), reel_id))
+    return jsonify({"detail": rescan.batch_detail(db, it["batch_id"]),
+                    "state": state(reel_id)})
+
+
+@app.route("/api/rescans/<int:batch_id>/accept-clean", methods=["POST"])
+def rescan_accept_clean(batch_id):
+    b = _rescan_batch_or_404(batch_id)
+    reel_id = b["reel_id"]
+    db.save_revision(reel_id, "批量接受补扫批次「%s」无冲突项" % b["name"])
+    _rid, changed, extra, errors = rescan.accept_clean(db, batch_id)
+    db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
+    if changed:
+        analysis.recheck(db, reel_id, changed)
+    db.run("UPDATE revisions SET extra=? WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
+           (json.dumps(extra, ensure_ascii=False), reel_id))
+    return jsonify({"detail": rescan.batch_detail(db, batch_id),
+                    "errors": errors, "state": state(reel_id)})
+
+
+@app.route("/api/rescan-files/<int:file_id>/thumb")
+def rescan_file_thumb(file_id):
+    rf = db.one("SELECT * FROM rescan_files WHERE id=?", (file_id,))
+    if not rf:
+        abort(404)
+    w = max(40, min(1600, int(request.args.get("w", 520))))
+    data = imaging.make_thumb(rf["stored_path"], 0, w)
+    return send_file(io.BytesIO(data), mimetype="image/jpeg")
+
+
+@app.route("/api/reels/<int:reel_id>/sample-rescan", methods=["POST"])
+def sample_rescan(reel_id):
+    """为演示卷生成一批补扫件（含改名文件与各类拦截样例）。"""
+    from qc_core import sample_rescan
+    reel = reel_or_404(reel_id)
+    zip_bytes, manifest_bytes = sample_rescan.build_sample_rescan(db, reel_id, reel["reel_no"])
+    entries = rescan.parse_backfill_manifest(manifest_bytes.decode("utf-8-sig"))
+    name = "补扫批次（内置样例）"
+    batch_id = rescan.import_batch(db, DATA, reel_id, reel["reel_no"], name,
+                                   zip_bytes, entries,
+                                   note="含改名回填、重拍替换及跨卷/错卷/重复占用拦截样例")
+    return jsonify({"batch_id": batch_id, "detail": rescan.batch_detail(db, batch_id),
+                    "state": state(reel_id)})
+
+
+@app.route("/api/rescans/<int:batch_id>/export/batch.json")
+def export_rescan_batch_json(batch_id):
+    b = _rescan_batch_or_404(batch_id)
+    payload = rescan.batch_export_json(db, batch_id)
+    payload["exported_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    buf = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+    return send_file(buf, mimetype="application/json", as_attachment=True,
+                     download_name="rescan_batch_%d.json" % batch_id)
+
+
+@app.route("/api/rescans/<int:batch_id>/export/decisions.csv")
+def export_rescan_decisions(batch_id):
+    _rescan_batch_or_404(batch_id)
+    data = rescan.decisions_csv(db, batch_id)
+    return send_file(io.BytesIO(data), mimetype="text/csv", as_attachment=True,
+                     download_name="rescan_decisions_%d.csv" % batch_id)
+
+
 # ---------------------------------------------------------------- 导出
 
 def export_rows(reel_id):
     frames = [dict(f) for f in db.frames(reel_id) if not f["excluded"]]
+    versions = db.q(
+        "SELECT frame_id, kind, source FROM frame_versions WHERE reel_id=? AND is_current=1",
+        (reel_id,))
+    vsrc = {v["frame_id"]: v for v in versions}
     rows = []
     for i, f in enumerate(frames):
+        v = vsrc.get(f["id"])
         rows.append({
             "seq": i + 1,
             "reel_no": db.one("SELECT reel_no FROM reels WHERE id=?", (reel_id,))["reel_no"],
@@ -380,6 +604,9 @@ def export_rows(reel_id):
             "status": ("缺帧占位" if f["placeholder"] else
                        "需重拍" if f["reshoot"] else "合格"),
             "reshoot": "是" if (f["reshoot"] or f["placeholder"]) else "",
+            "current_source": ("补扫回填" if v and v["kind"] in ("fill", "reshoot")
+                               else "原始扫描" if v else ""),
+            "provenance": v["source"] if v else "",
             "note": f["note"],
         })
     return rows
@@ -397,8 +624,9 @@ def export_manifest(reel_id, fmt):
         return send_file(buf, mimetype="application/json", as_attachment=True,
                          download_name="%s_manifest.json" % reel["reel_no"])
     buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()) if rows else
-                       ["seq", "reel_no", "frame_no", "filename", "rotation", "status", "reshoot", "note"])
+    default_cols = ["seq", "reel_no", "frame_no", "filename", "rotation", "status",
+                    "reshoot", "current_source", "provenance", "note"]
+    w = csv.DictWriter(buf, fieldnames=list(rows[0].keys()) if rows else default_cols)
     w.writeheader()
     w.writerows(rows)
     return send_file(io.BytesIO(buf.getvalue().encode("utf-8-sig")), mimetype="text/csv",

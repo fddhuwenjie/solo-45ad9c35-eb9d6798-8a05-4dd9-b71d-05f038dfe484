@@ -8,6 +8,7 @@ INV_GAIN = 3.0         # 顺序倒置：交换相邻帧后连续性 MAD 收益�
 INV_RATIO = 1.3        # 顺序倒置：交换前/后 MAD 比值阈值
 BRIGHT_JUMP = 45.0     # 相邻帧亮度突变阈值 (0-255)
 ORIENT_MIN = 30.0      # 方向分数绝对值下限
+RECHECK_RADIUS = 3     # 局部重算窗口半径
 
 
 def _num(frame_no):
@@ -15,21 +16,21 @@ def _num(frame_no):
     return int(m.group()) if m else None
 
 
-def run_checks(db, reel_id):
-    """重算连续性告警；已人工确认的告警按签名保留确认状态。"""
-    old = db.q("SELECT type, frame_no, message FROM warnings WHERE reel_id=? AND resolved=1", (reel_id,))
-    resolved_sigs = {(r["type"], r["frame_no"], r["message"]) for r in old}
-    db.run("DELETE FROM warnings WHERE reel_id=?", (reel_id,))
+def compute_warnings(frames):
+    """根据当前帧序列计算全部告警（纯函数，不碰库）。
 
-    frames = [dict(r) for r in db.frames(reel_id)]
+    返回记录列表：{frame_id, frame_no, type, message, touches:set[frame_id]}，
+    touches 为该告警所“触及”的帧，局部重算据此判断是否落在变更窗口内。
+    """
     active = [f for f in frames if not f["excluded"]]
     found = []
 
-    def add(frame, wtype, message):
+    def add(frame, wtype, message, touches=None):
         found.append({
             "frame_id": frame["id"] if frame else None,
             "frame_no": frame["frame_no"] if frame else "",
             "type": wtype, "message": message,
+            "touches": set(touches or ([frame["id"]] if frame else [])),
         })
 
     # 1) 缺帧：占位帧始终携带缺帧告警（直至人工确认）；另查帧号序列空洞
@@ -44,7 +45,8 @@ def run_checks(db, reel_id):
         if n1 - n0 > 1:
             missing = [str(x) for x in range(n0 + 1, n1)]
             label = "、".join(missing[:8]) + ("…" if len(missing) > 8 else "")
-            add(active[i1], "missing", "缺帧：%s 与 %s 之间缺少 %s" % (n0, n1, label))
+            add(active[i1], "missing", "缺帧：%s 与 %s 之间缺少 %s" % (n0, n1, label),
+                touches=[active[i0]["id"], active[i1]["id"]])
 
     # 2) 重复扫描：感知哈希近似（空白引导帧除外——片头片尾本就相似）
     hashed = [f for f in active
@@ -57,7 +59,8 @@ def run_checks(db, reel_id):
             if d <= DUP_HAMMING:
                 add(b, "duplicate",
                     "重复扫描：No.%s 与 No.%s 内容几乎相同（哈希距离 %d），建议剔除其一"
-                    % (a["frame_no"], b["frame_no"], d))
+                    % (a["frame_no"], b["frame_no"], d),
+                    touches=[a["id"], b["id"]])
 
     # 4) 方向异常：与全卷方向分数中位数符号相反（先算，供倒置检测排除）
     seq = [f for f in active if not f["placeholder"] and f["cvec"]]
@@ -71,7 +74,7 @@ def run_checks(db, reel_id):
                 if abs(s) >= ORIENT_MIN and (s < 0) != (med < 0):
                     orient_bad.add(f["id"])
                     add(f, "orientation",
-                        "方向异常：No.%s 排版方向与全卷不一致（分数 %.0f，卷中位 %.0f），可能旋转了 90°"
+                        "方向异常：No.%s 排版方向与全卷不一致（分数 %.0f，卷中位 %.0f），可能旋转了90°"
                         % (f["frame_no"], s, med))
 
     # 3) 顺序倒置：交换相邻两帧能显著降低连续性 MAD（跳过方向异常帧）
@@ -86,7 +89,8 @@ def run_checks(db, reel_id):
             f1, f2 = quad[1], quad[2]
             add(f2, "inversion",
                 "顺序倒置：No.%s 与 No.%s 疑似颠倒，交换后与前后帧更连贯"
-                % (f1["frame_no"], f2["frame_no"]))
+                % (f1["frame_no"], f2["frame_no"]),
+                touches=[q["id"] for q in quad])
 
     # 5) 相邻帧亮度突变：与最近若干帧的中位亮度比较
     recent = []
@@ -94,22 +98,100 @@ def run_checks(db, reel_id):
         if f["placeholder"]:
             continue
         if recent:
-            base = sorted(recent)[len(recent) // 2]
+            base = sorted([x[1] for x in recent])[len(recent) // 2]
             delta = f["brightness"] - base
             if abs(delta) >= BRIGHT_JUMP:
                 add(f, "brightness",
                     "亮度突变：No.%s 亮度 %.0f，与邻近帧基准 %.0f 相差 %.0f，检查曝光/扫描参数"
-                    % (f["frame_no"], f["brightness"], base, abs(delta)))
-        recent.append(f["brightness"])
+                    % (f["frame_no"], f["brightness"], base, abs(delta)),
+                    touches=[x[0] for x in recent] + [f["id"]])
+        recent.append((f["id"], f["brightness"]))
         if len(recent) > 3:
             recent.pop(0)
 
+    return found
+
+
+def _persist_warnings(db, reel_id, found):
+    """计算结果落库；已人工确认的告警按签名保留确认状态。"""
+    old = db.q("SELECT type, frame_no, message FROM warnings WHERE reel_id=? AND resolved=1",
+               (reel_id,))
+    resolved_sigs = {(r["type"], r["frame_no"], r["message"]) for r in old}
+    db.run("DELETE FROM warnings WHERE reel_id=?", (reel_id,))
     for w in found:
         sig = (w["type"], w["frame_no"], w["message"])
-        db.run("INSERT INTO warnings(reel_id, frame_id, frame_no, type, message, resolved) VALUES(?,?,?,?,?,?)",
-               (reel_id, w["frame_id"], w["frame_no"], w["type"], w["message"],
-                1 if sig in resolved_sigs else 0))
+        db.run(
+            "INSERT INTO warnings(reel_id, frame_id, frame_no, type, message, resolved) VALUES(?,?,?,?,?,?)",
+            (reel_id, w["frame_id"], w["frame_no"], w["type"], w["message"],
+             1 if sig in resolved_sigs else 0))
+
+
+def run_checks(db, reel_id):
+    """全量重算某卷的连续性告警。"""
+    frames = [dict(r) for r in db.frames(reel_id)]
+    found = compute_warnings(frames)
+    _persist_warnings(db, reel_id, found)
     return found
+
+
+def recheck(db, reel_id, changed_ids):
+    """只重算变更帧及其相邻帧窗口内的告警；窗口外告警原样保留（确认状态不丢）。
+
+    补扫回填后帧集未变（占位帧就地补图），因此按“触及帧是否落入窗口”判定替换范围。
+    """
+    if not changed_ids:
+        return
+    frames = [dict(r) for r in db.frames(reel_id)]
+    active = [f for f in frames if not f["excluded"]]
+    idx = {f["id"]: i for i, f in enumerate(active)}
+    window = set()
+    for cid in changed_ids:
+        i = idx.get(cid)
+        if i is None:
+            continue
+        for k in range(max(0, i - RECHECK_RADIUS), min(len(active), i + RECHECK_RADIUS + 1)):
+            window.add(active[k]["id"])
+    # 兜底：帧不存在于 active（被剔除等），至少包含自身
+    for cid in changed_ids:
+        window.add(cid)
+
+    old = db.q("SELECT * FROM warnings WHERE reel_id=?", (reel_id,))
+    id_by_no = {}
+    for f in frames:
+        id_by_no.setdefault(str(f["frame_no"]), f["id"])
+    kept = []
+    for r in old:
+        touches = {r["frame_id"]} if r["frame_id"] else set()
+        m = re.findall(r"No\.(\w+)", r["message"] or "")
+        for x in m:
+            if x in id_by_no:
+                touches.add(id_by_no[x])
+        n0 = re.match(r"缺帧：(\d+) 与 (\d+)", r["message"] or "")
+        if n0:
+            for x in n0.groups():
+                if x in id_by_no:
+                    touches.add(id_by_no[x])
+        if touches & window:
+            continue  # 落在窗口内：用新计算结果替换
+        kept.append(dict(r))
+
+    found = compute_warnings(frames)
+    new = [w for w in found if w["touches"] & window]
+
+    resolved_sigs = {(r["type"], r["frame_no"], r["message"])
+                     for r in old if r["resolved"]}
+    db.run("DELETE FROM warnings WHERE reel_id=?", (reel_id,))
+    for r in kept:
+        db.run(
+            "INSERT INTO warnings(reel_id, frame_id, frame_no, type, message, resolved) VALUES(?,?,?,?,?,?)",
+            (reel_id, r["frame_id"], r["frame_no"], r["type"], r["message"], r["resolved"]))
+    for w in new:
+        sig = (w["type"], w["frame_no"], w["message"])
+        db.run(
+            "INSERT INTO warnings(reel_id, frame_id, frame_no, type, message, resolved) VALUES(?,?,?,?,?,?)",
+            (reel_id, w["frame_id"], w["frame_no"], w["type"], w["message"],
+             1 if sig in resolved_sigs else 0))
+    return new
 
 
 def finalization_checks(db, reel_id):

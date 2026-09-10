@@ -80,6 +80,7 @@ function renderAll() {
   renderChecks();
   $("#btnUndo").disabled = !state.data.can_undo;
 }
+window.renderAll = renderAll;
 
 function renderInfo() {
   const d = state.data;
@@ -116,6 +117,13 @@ function renderStrip() {
     no.className = "fno";
     no.textContent = "No." + f.frame_no + (f.rotation ? ` ⟳${f.rotation}°` : "");
     div.appendChild(no);
+    if (f.version_kind === "fill" || f.version_kind === "reshoot") {
+      const rb = document.createElement("span");
+      rb.className = "rbmark";
+      rb.title = f.source || "补扫回填";
+      rb.textContent = "补";
+      div.appendChild(rb);
+    }
     if (warnCountOf(f.id)) {
       const dot = document.createElement("span");
       dot.className = "wdot";
@@ -212,6 +220,7 @@ function renderDetail() {
         <div><b>No.${f.frame_no}</b>　${f.filename || "（占位帧）"}</div>
         <div>状态：${flags}</div>
         <div>亮度：${f.brightness.toFixed(1)}　方向分：${f.orient_score.toFixed(0)}</div>
+        <div>${f.source ? "当前有效图来源：" + f.source + (f.version_count > 1 ? `（共 ${f.version_count} 个历史版本）` : "") : ""}</div>
         <div>${f.note ? "备注：" + f.note : ""}</div>
       </div>
     </div>

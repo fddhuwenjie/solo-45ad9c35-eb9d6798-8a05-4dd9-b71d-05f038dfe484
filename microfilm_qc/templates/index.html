@@ -68,9 +68,51 @@
       <div id="compare" class="compare hidden"></div>
     </section>
   </div>
+
+  <section class="panel rescan-panel">
+    <div class="rescan-head">
+      <h3>📥 补扫回填 <span id="rbBatchCount" class="badge gray"></span></h3>
+      <div class="rescan-actions">
+        <button id="btnSampleRescan" class="ghost">生成演示补扫批次</button>
+        <button id="btnRescanImport">导入补扫 ZIP + 回填清单</button>
+      </div>
+    </div>
+
+    <div id="rescanImportPanel" class="hidden rescan-form">
+      <div class="import-grid">
+        <label>补扫图像 ZIP（TIFF/JPEG）<input type="file" id="rbZip" accept=".zip"></label>
+        <label>回填清单 CSV/JSON（reel_no, frame_no, filename）<input type="file" id="rbManifest" accept=".csv,.json"></label>
+        <label>批次名称<input type="text" id="rbName" placeholder="默认取 ZIP 文件名"></label>
+        <button id="btnDoRescanImport" class="primary">开始导入并校验</button>
+      </div>
+      <p class="hint">只匹配缺帧占位或已标记重拍的帧；跨卷、一帧多文件、同文件重复占用、目标不存在将被拦截并写明原因。</p>
+    </div>
+
+    <div id="rescanEmpty" class="hint">暂无补扫批次。扫描组发回补扫后，在此导入 ZIP 与回填清单。</div>
+
+    <div id="rbBatchBar" class="rb-batchbar hidden">
+      <select id="rbBatchSelect"></select>
+      <span id="rbBatchInfo" class="hint"></span>
+      <span class="spacer"></span>
+      <button id="btnRbAcceptClean" class="primary">批量接受无冲突项</button>
+      <button id="btnRbExportJson">导出批次 JSON</button>
+      <button id="btnRbExportCsv">导出接受/拒绝明细</button>
+      <button id="btnRbExportManifest">导出更新后移交清单</button>
+    </div>
+    <div class="rb-filters">
+      <button data-f="all" class="rb-tab active">全部</button>
+      <button data-f="pending" class="rb-tab">待处理</button>
+      <button data-f="blocked" class="rb-tab">已拦截</button>
+      <button data-f="accepted" class="rb-tab">已接受</button>
+      <button data-f="rejected" class="rb-tab">已拒绝</button>
+      <span id="rbUnused" class="hint"></span>
+    </div>
+    <div id="rbItems" class="rb-items"></div>
+  </section>
 </main>
 
 <input type="file" id="hiddenFile" class="hidden">
 <script src="/static/app.js"></script>
+<script src="/static/rescan.js"></script>
 </body>
 </html>
