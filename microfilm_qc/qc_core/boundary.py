@@ -607,8 +607,33 @@ def discard_op(db, op_id):
         db.run("DELETE FROM boundary_ops WHERE id=?", (op_id,))
 
 
-def split_frame(db, root, reel_id, frame_id, cuts, reason="", op_id=None):
-    """确认拆分。返回 (anchor_id, [output_ids], extra, op_id)。"""
+def _simulate_split_frames(frames, anchor_pos, n_fill, n_new, virtual_ids):
+    """构造拆分后的帧排列（纯内存，不写库），供写入前编号校验。
+
+    位置规则与 split_frame 的真实写入严格一致：
+      - 锚点前帧不动；锚点保留原位；
+      - 锚点后紧随的 n_fill 个缺帧占位被片段填充，位置不变；
+      - 新增片段以虚拟帧（frame_no=''、负数 id）插入锚点填充区之后；
+      - 填充区之后的既有帧整体后移 n_new 位。
+    """
+    sim = []
+    for fr in sorted(frames, key=lambda x: x["position"]):
+        p = fr["position"]
+        if p <= anchor_pos + n_fill:
+            sim.append(dict(fr))
+        else:
+            d = dict(fr)
+            d["position"] = p + n_new
+            sim.append(d)
+    for j, vid in enumerate(virtual_ids):
+        sim.append({"id": vid, "position": anchor_pos + n_fill + 1 + j, "frame_no": ""})
+    sim.sort(key=lambda x: x["position"])
+    return sim
+
+
+def _compute_split_plan(db, reel_id, frame_id, cuts):
+    """只读预检：在任何文件/数据库写入前完成拆分的全部业务校验，并在内存中模拟
+    写入后的位置与编号（含空号/重号断言）。通过返回执行计划，失败抛 ValueError。"""
     f = db.one("SELECT * FROM frames WHERE id=?", (frame_id,))
     if not f:
         raise ValueError("帧不存在")
@@ -619,47 +644,20 @@ def split_frame(db, root, reel_id, frame_id, cuts, reason="", op_id=None):
     axis, poss = _ordered_cuts(cuts)
     if not poss:
         raise ValueError("请至少添加一条切线")
-    if op_id is None:
-        op_id = create_op(db, reel_id, "split", reason)
 
-    t0 = time.time()
-    paths, boxes, seg_dims = [], [], []
+    seg_boxes, seg_dims = [], []
     with Image.open(f["stored_path"]) as im:
         img = imaging.apply_rotation(im.convert("RGB"), f["rotation"])
         full = img.width if axis == "x" else img.height
         for p in poss:
             if not (0 < p < full):
                 raise ValueError("切点 %d 超出画面（0-%d）" % (p, full))
-        segs = _segments(img, axis, poss)
-        bdir = _boundary_dir(root, reel_id)
-        for i, (box, segim) in enumerate(segs):
-            p = os.path.join(bdir, "op%d_f%d_seg%d.tif" % (op_id, f["id"], i + 1))
-            segim.save(p, "TIFF")
-            paths.append(p)
-            boxes.append(box)
+        segs = _segments(img, axis, poss)  # 零宽/越界/交叉校验（仅内存裁切）
+        for box, segim in segs:
+            seg_boxes.append(box)
             seg_dims.append((segim.width, segim.height))
 
-    # 第 1 段就地更新锚点帧
-    anchor_path = paths[0]
-    fp0 = imaging.fingerprint(anchor_path)
-    db.run(
-        """UPDATE frames SET filename=?, stored_path=?, width=?, height=?, phash=?, cvec=?,
-                             brightness=?, ink=?, orient_score=?, rotation=0 WHERE id=?""",
-        (os.path.basename(anchor_path), anchor_path, fp0["width"], fp0["height"],
-         fp0["phash"], fp0["cvec"], fp0["brightness"], fp0["ink"], fp0["orient_score"],
-         frame_id))
-    old_ver = db.one("SELECT id FROM frame_versions WHERE frame_id=? AND is_current=1",
-                     (frame_id,))
-    if old_ver:
-        db.run("UPDATE frame_versions SET is_current=0 WHERE id=?", (old_ver["id"],))
-    db.add_version(frame_id, reel_id, "boundary", os.path.basename(anchor_path), anchor_path,
-                   source="帧边界拆分（第 1/%d 段）" % len(paths), op_id=op_id, is_current=1)
-
-    # 第 2..k 段的位置安排：锚点之后需要 len(paths)-1 个连续位置。
-    # 紧随锚点的缺帧占位（在导入时就对应粘连图内缺失页）就地补图；不足部分新增帧。
-    # 先为新增片段腾位，再让占位帧落到其目标位置，保证输出段在胶片带上连续。
-    n_seg = len(paths) - 1
-    frames_now = db.frames(reel_id)
+    frames_now = [dict(x) for x in db.frames(reel_id)]
     anchor_pos = next(x["position"] for x in frames_now if x["id"] == frame_id)
     trailing = sorted((x for x in frames_now if x["position"] > anchor_pos),
                       key=lambda x: x["position"])
@@ -669,80 +667,168 @@ def split_frame(db, root, reel_id, frame_id, cuts, reason="", op_id=None):
             placeholders.append(x)
         else:
             break
-    n_fill = min(n_seg, len(placeholders))
-    n_new = n_seg - n_fill
+    n_seg = len(segs)
+    n_fill = min(n_seg - 1, len(placeholders))
+    n_new = (n_seg - 1) - n_fill
 
-    # 1) 锚点之后所有帧后移 n_new 位，给新增片段腾出连续位置
-    if n_new:
-        db.run("UPDATE frames SET position=position+? WHERE reel_id=? AND position>?",
-               (n_new, reel_id, anchor_pos))
+    virtual_ids = [-(i + 1) for i in range(n_new)]
+    sim = _simulate_split_frames(frames_now, anchor_pos, n_fill, n_new, virtual_ids)
+    changed_no = _renumber_after_split(sim, anchor_pos, n_seg, n_fill, set(virtual_ids))
+    return {
+        "frame": dict(f), "axis": axis, "cuts": poss, "full": full,
+        "seg_boxes": seg_boxes, "seg_dims": seg_dims,
+        "anchor_pos": anchor_pos, "placeholders": [dict(x) for x in placeholders],
+        "n_fill": n_fill, "n_new": n_new, "n_seg": n_seg,
+        "renumbered": changed_no,
+    }
 
-    # 2) 目标位置 -> 片段：第 2..n_fill+1 段填充占位，其余为新增
+
+def plan_split(db, reel_id, frame_id, cuts):
+    """对外只读预检入口（不落盘、不写库、不留修订）。"""
+    return _compute_split_plan(db, reel_id, frame_id, cuts)
+
+
+def _hard_restore_split(db, reel_id, snapshot, op_id, saved_paths):
+    """拆分写入阶段失败时的硬恢复：把帧/编号/位置/版本指针恢复到拆分前快照，
+    删除本次已写入的边界版本、来源、操作批次行与已生成文件。"""
+    # 先删本次新增的边界版本（含中途新建片段帧上的），避免污染版本指针
+    db.run("DELETE FROM frame_versions WHERE kind='boundary' AND op_id=?", (op_id,))
+    # 帧表按拆分前快照恢复（中途新增帧一并删除）
+    db.restore_frames_snapshot(reel_id, snapshot)
+    # 恢复锚点/填充帧的当前版本指针到幸存版本中的最新一条（即拆分前当前版本）
+    for fr in snapshot:
+        row = db.one("SELECT id FROM frame_versions WHERE frame_id=? ORDER BY id DESC LIMIT 1",
+                     (fr["id"],))
+        if row:
+            db.run("UPDATE frame_versions SET is_current=1 WHERE id=?", (row["id"],))
+    db.run("DELETE FROM frame_sources WHERE op_id=?", (op_id,))
+    db.run("DELETE FROM boundary_ops WHERE id=?", (op_id,))
+    for p in saved_paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def split_frame(db, root, reel_id, frame_id, cuts, reason="", op_id=None):
+    """确认拆分。返回 (anchor_id, [output_ids], extra, op_id)。
+
+    先跑只读预检（plan），任何业务校验（含拆分后空号/重号）失败都在写入前抛出；
+    预检通过后才落盘写库，写入阶段若意外失败则按拆分前快照硬恢复，保证原子性。"""
+    plan = _compute_split_plan(db, reel_id, frame_id, cuts)
+    f = plan["frame"]
+    axis, poss, full = plan["axis"], plan["cuts"], plan["full"]
+    seg_boxes, seg_dims = plan["seg_boxes"], plan["seg_dims"]
+    anchor_pos = plan["anchor_pos"]
+    placeholders, n_fill, n_new, n_seg = (
+        plan["placeholders"], plan["n_fill"], plan["n_new"], plan["n_seg"])
+    if op_id is None:
+        op_id = create_op(db, reel_id, "split", reason)
+
+    t0 = time.time()
+    snapshot = db.snapshot(reel_id)
+    paths = []
     output_ids = [frame_id]
     new_frame_ids, filled_ids = [], []
-    for seg_i in range(1, n_seg + 1):
-        target_pos = anchor_pos + seg_i
-        path = paths[seg_i]
-        fp = imaging.fingerprint(path)
-        ph = placeholders[seg_i - 1] if seg_i - 1 < n_fill else None
-        if ph:
-            # 占位帧移动到该段的目标位置后补图
-            db.run("UPDATE frames SET position=? WHERE id=?", (target_pos, ph["id"]))
-            db.run(
-                """UPDATE frames SET filename=?, stored_path=?, width=?, height=?, phash=?, cvec=?,
-                                     brightness=?, ink=?, orient_score=?, rotation=0,
-                                     placeholder=0, reshoot=0, note=? WHERE id=?""",
-                (os.path.basename(path), path, fp["width"], fp["height"], fp["phash"],
-                 fp["cvec"], fp["brightness"], fp["ink"], fp["orient_score"],
-                 (ph["note"] + " " if ph["note"] else "")
-                 + "拆分填充自 No.%s" % f["frame_no"], ph["id"]))
-            db.add_version(ph["id"], reel_id, "boundary", os.path.basename(path), path,
-                           source="帧边界拆分（第 %d/%d 段，填充缺帧占位）" % (seg_i + 1, n_seg + 1),
-                           op_id=op_id, is_current=1)
-            output_ids.append(ph["id"])
-            filled_ids.append(ph["id"])
-        else:
-            nid = db.add_frame(reel_id, position=target_pos, frame_no="",
-                               filename=os.path.basename(path), stored_path=path,
-                               note="拆分自 No.%s" % f["frame_no"], placeholder=0, **fp)
-            db.add_version(nid, reel_id, "boundary", os.path.basename(path), path,
-                           source="帧边界拆分（第 %d/%d 段）" % (seg_i + 1, n_seg + 1),
-                           op_id=op_id, is_current=1)
-            output_ids.append(nid)
-            new_frame_ids.append(nid)
+    try:
+        # 1) 裁切并写入片段文件（预检已保证几何合法）
+        bdir = _boundary_dir(root, reel_id)
+        with Image.open(f["stored_path"]) as im:
+            img = imaging.apply_rotation(im.convert("RGB"), f["rotation"])
+            segs = _segments(img, axis, poss)
+            for i, (_box, segim) in enumerate(segs):
+                p = os.path.join(bdir, "op%d_f%d_seg%d.tif" % (op_id, f["id"], i + 1))
+                segim.save(p, "TIFF")
+                paths.append(p)
 
-    _normalize_positions(db, reel_id)
-    anchor2 = db.one("SELECT position FROM frames WHERE id=?", (frame_id,))
-    changed_no = _renumber_after_split(db.frames(reel_id), anchor2["position"],
-                                       len(output_ids), len(filled_ids), new_frame_ids)
-    for fid, no in changed_no.items():
-        db.run("UPDATE frames SET frame_no=? WHERE id=?", (no, fid))
+        # 2) 第 1 段就地更新锚点帧
+        anchor_path = paths[0]
+        fp0 = imaging.fingerprint(anchor_path)
+        db.run(
+            """UPDATE frames SET filename=?, stored_path=?, width=?, height=?, phash=?, cvec=?,
+                                 brightness=?, ink=?, orient_score=?, rotation=0 WHERE id=?""",
+            (os.path.basename(anchor_path), anchor_path, fp0["width"], fp0["height"],
+             fp0["phash"], fp0["cvec"], fp0["brightness"], fp0["ink"], fp0["orient_score"],
+             frame_id))
+        old_ver = db.one("SELECT id FROM frame_versions WHERE frame_id=? AND is_current=1",
+                         (frame_id,))
+        if old_ver:
+            db.run("UPDATE frame_versions SET is_current=0 WHERE id=?", (old_ver["id"],))
+        db.add_version(frame_id, reel_id, "boundary", os.path.basename(anchor_path), anchor_path,
+                       source="帧边界拆分（第 1/%d 段）" % len(paths), op_id=op_id, is_current=1)
 
-    detail = {
-        "axis": axis, "cuts": poss, "full": full,
-        "input": [{"frame_id": frame_id, "frame_no": f["frame_no"],
-                   "filename": f["filename"], "path": f["stored_path"]}],
-        "outputs": [{"frame_id": fid} for fid in output_ids],
-        "new_frame_ids": new_frame_ids, "filled_placeholders": filled_ids,
-        "renumbered": {str(k): v for k, v in changed_no.items()},
-        "segments": [{"dims": list(d)} for d in seg_dims],
-        "reason": reason, "op_id": op_id,
-    }
-    db.run("UPDATE boundary_ops SET detail=? WHERE id=?",
-           (json.dumps(detail, ensure_ascii=False), op_id))
-    for k, fid in enumerate(output_ids):
-        db.add_frame_source(fid, reel_id, "crop", source_frame_id=frame_id, op_id=op_id,
-                            source_path=f["stored_path"], source_filename=f["filename"],
-                            region={"axis": axis, "box": list(boxes[k]), "cuts": poss,
-                                    "index": k, "count": len(output_ids),
-                                    "rotation": f["rotation"], "full": full})
+        # 3) 为新增片段腾位（占位填充帧本就在连续位置，无需移动）
+        if n_new:
+            db.run("UPDATE frames SET position=position+? WHERE reel_id=? AND position>?",
+                   (n_new, reel_id, anchor_pos + n_fill))
 
-    extra = {"boundary": {"op": "split", "op_id": op_id, "anchor_id": frame_id,
-                          "new_frame_ids": new_frame_ids, "filled_placeholders": filled_ids,
-                          "renumber_ids": list(changed_no.keys()),
-                          "old_version_id": old_ver["id"] if old_ver else None,
-                          "files": paths, "elapsed": round(time.time() - t0, 2)}}
-    return frame_id, output_ids, extra, op_id
+        # 4) 第 2..k 段：前 n_fill 段填充占位，其余新增
+        for seg_i in range(1, n_seg):
+            target_pos = anchor_pos + seg_i
+            path = paths[seg_i]
+            fp = imaging.fingerprint(path)
+            ph = placeholders[seg_i - 1] if seg_i - 1 < n_fill else None
+            if ph:
+                db.run(
+                    """UPDATE frames SET filename=?, stored_path=?, width=?, height=?, phash=?, cvec=?,
+                                         brightness=?, ink=?, orient_score=?, rotation=0,
+                                         placeholder=0, reshoot=0, note=? WHERE id=?""",
+                    (os.path.basename(path), path, fp["width"], fp["height"], fp["phash"],
+                     fp["cvec"], fp["brightness"], fp["ink"], fp["orient_score"],
+                     (ph["note"] + " " if ph["note"] else "")
+                     + "拆分填充自 No.%s" % f["frame_no"], ph["id"]))
+                db.add_version(ph["id"], reel_id, "boundary", os.path.basename(path), path,
+                               source="帧边界拆分（第 %d/%d 段，填充缺帧占位）" % (seg_i + 1, n_seg),
+                               op_id=op_id, is_current=1)
+                output_ids.append(ph["id"])
+                filled_ids.append(ph["id"])
+            else:
+                nid = db.add_frame(reel_id, position=target_pos, frame_no="",
+                                   filename=os.path.basename(path), stored_path=path,
+                                   note="拆分自 No.%s" % f["frame_no"], placeholder=0, **fp)
+                db.add_version(nid, reel_id, "boundary", os.path.basename(path), path,
+                               source="帧边界拆分（第 %d/%d 段）" % (seg_i + 1, n_seg),
+                               op_id=op_id, is_current=1)
+                output_ids.append(nid)
+                new_frame_ids.append(nid)
+
+        _normalize_positions(db, reel_id)
+        anchor2 = db.one("SELECT position FROM frames WHERE id=?", (frame_id,))
+        changed_no = _renumber_after_split(db.frames(reel_id), anchor2["position"],
+                                           len(output_ids), len(filled_ids), new_frame_ids)
+        for fid, no in changed_no.items():
+            db.run("UPDATE frames SET frame_no=? WHERE id=?", (no, fid))
+
+        detail = {
+            "axis": axis, "cuts": poss, "full": full,
+            "input": [{"frame_id": frame_id, "frame_no": f["frame_no"],
+                       "filename": f["filename"], "path": f["stored_path"]}],
+            "outputs": [{"frame_id": fid} for fid in output_ids],
+            "new_frame_ids": new_frame_ids, "filled_placeholders": filled_ids,
+            "renumbered": {str(k): v for k, v in changed_no.items()},
+            "segments": [{"dims": list(d)} for d in seg_dims],
+            "reason": reason, "op_id": op_id,
+        }
+        db.run("UPDATE boundary_ops SET detail=? WHERE id=?",
+               (json.dumps(detail, ensure_ascii=False), op_id))
+        for k, fid in enumerate(output_ids):
+            db.add_frame_source(fid, reel_id, "crop", source_frame_id=frame_id, op_id=op_id,
+                                source_path=f["stored_path"], source_filename=f["filename"],
+                                region={"axis": axis, "box": list(seg_boxes[k]), "cuts": poss,
+                                        "index": k, "count": len(output_ids),
+                                        "rotation": f["rotation"], "full": full})
+
+        extra = {"boundary": {"op": "split", "op_id": op_id, "anchor_id": frame_id,
+                              "new_frame_ids": new_frame_ids, "filled_placeholders": filled_ids,
+                              "renumber_ids": list(changed_no.keys()),
+                              "old_version_id": old_ver["id"] if old_ver else None,
+                              "files": paths, "elapsed": round(time.time() - t0, 2)}}
+        return frame_id, output_ids, extra, op_id
+    except Exception:
+        # 写入阶段任何意外失败：恢复到拆分前状态后原样抛出（路由据此清理修订并返回错误）
+        _hard_restore_split(db, reel_id, snapshot, op_id, paths)
+        raise
 
 
 def _normalize_positions(db, reel_id):

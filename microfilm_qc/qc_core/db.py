@@ -242,6 +242,30 @@ class DB:
         return self.q("SELECT id, action, created_at FROM revisions WHERE reel_id=? ORDER BY id DESC",
                       (reel_id,))
 
+    def restore_frames_snapshot(self, reel_id, snapshot):
+        """把帧表恢复到给定快照（不依赖 revisions 行），用于边界操作写入失败时的硬回滚。
+
+        快照中不存在的帧（拆分中途新增的片段）连同其版本/来源一并删除；
+        快照中的帧按 id 原地更新/插回，保证既有版本等引用不失效。
+        """
+        snap_ids = {fr["id"] for fr in snapshot}
+        for r in self.frames(reel_id):
+            if r["id"] not in snap_ids:
+                self.run("DELETE FROM frame_sources WHERE frame_id=?", (r["id"],))
+                self.run("DELETE FROM frame_versions WHERE frame_id=?", (r["id"],))
+                self.run("DELETE FROM frames WHERE id=?", (r["id"],))
+        for fr in snapshot:
+            exists = self.one("SELECT 1 FROM frames WHERE id=?", (fr["id"],))
+            if exists:
+                sets = ",".join("%s=?" % c for c in FRAME_COLS[1:])
+                self.run("UPDATE frames SET %s WHERE id=?" % sets,
+                         [fr[c] for c in FRAME_COLS[1:]] + [fr["id"]])
+            else:
+                ph = ",".join(["?"] * (len(FRAME_COLS) + 1))
+                self.run("INSERT INTO frames(reel_id,%s) VALUES(%s)" %
+                         (",".join(FRAME_COLS), ph),
+                         [reel_id] + [fr[c] for c in FRAME_COLS])
+
     # ---- 帧边界复核 ----
     def add_boundary_op(self, reel_id, kind, reason, detail):
         cur = self.run(

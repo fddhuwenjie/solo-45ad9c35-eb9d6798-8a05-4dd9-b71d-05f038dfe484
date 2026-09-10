@@ -480,6 +480,12 @@ def boundary_split(frame_id):
     if len(norm) != len(cuts):
         abort(400, "切线格式无效（需要 {axis:'x'/'y', pos:像素}）")
     reason = str(body.get("reason", "")).strip()
+    # 写入前只读预检：裁切几何、零宽/交叉/越界、拆分后空号/重号等在此全部完成。
+    # 预检失败直接返回，绝不创建操作批次、修订或生成任何文件，保证失败零副作用。
+    try:
+        boundary.plan_split(db, reel_id, frame_id, norm)
+    except ValueError as ex:
+        return jsonify({"error": str(ex), "state": state(reel_id)}), 400
     op_id = boundary.create_op(db, reel_id, "split", reason)
     db.save_revision(reel_id, "帧边界拆分 No.%s（%d 段）" % (f["frame_no"], len(norm) + 1))
     rev_id = db.one("SELECT MAX(id) id FROM revisions WHERE reel_id=?", (reel_id,))["id"]
@@ -487,9 +493,12 @@ def boundary_split(frame_id):
         anchor, outputs, extra, op_id = boundary.split_frame(
             db, DATA, reel_id, frame_id, norm, reason=reason, op_id=op_id)
     except ValueError as ex:
-        boundary.discard_op(db, op_id)
+        # split_frame 已按拆分前快照硬恢复帧/文件/版本；这里只清掉本次修订行
         _boundary_abort_revision(reel_id)
         return jsonify({"error": str(ex), "state": state(reel_id)}), 400
+    except Exception:
+        _boundary_abort_revision(reel_id)
+        raise
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     _boundary_recheck(reel_id, outputs, extra["boundary"])
     db.run("UPDATE revisions SET extra=? WHERE id=?",

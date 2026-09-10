@@ -242,6 +242,119 @@ class BoundaryTests(unittest.TestCase):
                          rev_before)
         self.assertEqual(app.db.one("SELECT COUNT(*) c FROM boundary_ops")["c"], 0)
 
+    def _frame_signature(self):
+        """拆分前帧表指纹：id/位置/帧号/文件名/路径/占位/尺寸/旋转。"""
+        return [(r["id"], r["position"], r["frame_no"], r["filename"], r["stored_path"],
+                 r["placeholder"], r["width"], r["rotation"])
+                for r in app.db.frames(self.rid)]
+
+    def test_split_with_preexisting_duplicate_frameno_is_atomic(self):
+        """卷内已存在重复 frame_no：拆分必须在任何写入前被预检拒绝，
+        不新增帧、不动锚点/位置/编号、不留操作批次/修订/文件，既有撤销栈保持可用。"""
+        st = self._state()
+        f9 = self._frame(st, "9")
+        f11 = self._frame(st, "11")
+        # 人工制造卷内重号：No.11 -> "10"（与既有 No.10 重号）
+        app.db.run("UPDATE frames SET frame_no='10' WHERE id=?", (f11["id"],))
+
+        sig_before = self._frame_signature()
+        rev_before = app.db.one(
+            "SELECT COUNT(*) c FROM revisions WHERE reel_id=?", (self.rid,))["c"]
+        ops_before = app.db.one("SELECT COUNT(*) c FROM boundary_ops")["c"]
+        fver_before = app.db.one("SELECT COUNT(*) c FROM frame_versions")["c"]
+        anchor_path = app.db.one("SELECT stored_path FROM frames WHERE id=?", (f9["id"],))["stored_path"]
+        bdir = os.path.join(self.tmp, "boundary", str(self.rid))
+        os.makedirs(bdir, exist_ok=True)
+
+        r = self.c.post("/api/frame/%d/boundary/split" % f9["id"],
+                        json={"cuts": [{"axis": "x", "pos": 450}]})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("重复帧号", r.get_json()["error"])
+
+        # 帧表逐字段一致：无新增帧、无空号帧、锚点文件/旋转/尺寸未被替换
+        self.assertEqual(self._frame_signature(), sig_before)
+        self.assertFalse(any(not x[2] for x in self._frame_signature()))
+        row = app.db.one("SELECT filename,stored_path,width,rotation FROM frames WHERE id=?",
+                         (f9["id"],))
+        self.assertEqual(row["stored_path"], anchor_path)
+        self.assertEqual(row["width"], 900)
+        self.assertEqual(row["rotation"], 0)
+        cur = app.db.one(
+            "SELECT kind FROM frame_versions WHERE frame_id=? AND is_current=1", (f9["id"],))
+        self.assertTrue(cur is None or cur["kind"] != "boundary")
+        # 不产生操作批次、修订、边界版本或文件
+        self.assertEqual(app.db.one("SELECT COUNT(*) c FROM boundary_ops")["c"], ops_before)
+        self.assertEqual(app.db.one(
+            "SELECT COUNT(*) c FROM revisions WHERE reel_id=?", (self.rid,))["c"], rev_before)
+        self.assertEqual(app.db.one("SELECT COUNT(*) c FROM frame_versions")["c"], fver_before)
+        self.assertEqual(os.listdir(bdir), [])
+
+    def test_split_mid_write_failure_hard_restores_and_keeps_undo_stack(self):
+        """写入阶段意外失败（第 1 段锚点已替换之后）：按拆分前快照硬恢复，
+        锚点/占位/位置/编号/版本指针全部还原，生成文件删除，既有修订与撤销记录不被破坏。"""
+        st = self._state()
+        f5 = self._frame(st, "5")
+        f7 = self._frame(st, "7")
+        f8 = self._frame(st, "8")
+        # 先造一个合法的既有修订（旋转），失败后必须保留且仍可撤销
+        self.c.post("/api/frame/%d/rotate" % f5["id"], json={"deg": 90})
+        rev_actions_before = [r["action"] for r in app.db.q(
+            "SELECT action FROM revisions WHERE reel_id=? ORDER BY id", (self.rid,))]
+
+        glued_path = app.db.one("SELECT stored_path FROM frames WHERE id=?", (f7["id"],))["stored_path"]
+        sig_before = self._frame_signature()
+        fver_before = app.db.one("SELECT COUNT(*) c FROM frame_versions")["c"]
+        cand = self._candidates()
+        cut = next(s for s in cand["splits"] if s["frame_no"] == "7")["cuts"]
+        bdir = os.path.join(self.tmp, "boundary", str(self.rid))
+
+        # 让第 2 次 fingerprint（填充占位片段）抛错，此时锚点段已写入、占位尚未补图
+        from qc_core import imaging
+        orig_fp, n_calls = imaging.fingerprint, {"n": 0}
+
+        def boom(path):
+            n_calls["n"] += 1
+            if n_calls["n"] == 2:
+                raise RuntimeError("simulated write-phase failure")
+            return orig_fp(path)
+
+        imaging.fingerprint = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                self.c.post("/api/frame/%d/boundary/split" % f7["id"], json={"cuts": cut})
+        finally:
+            imaging.fingerprint = orig_fp
+
+        # 帧表逐字段还原（含占位恢复缺帧、锚点恢复粘连图、位置/编号还原）
+        self.assertEqual(self._frame_signature(), sig_before)
+        nrow = app.db.one("SELECT COUNT(*) c FROM frames WHERE reel_id=?", (self.rid,))["c"]
+        self.assertEqual(nrow, len(sig_before))
+        a8 = app.db.one("SELECT placeholder,width FROM frames WHERE id=?", (f8["id"],))
+        self.assertEqual((a8["placeholder"], a8["width"]), (1, 0))
+        a7 = app.db.one("SELECT stored_path,width FROM frames WHERE id=?", (f7["id"],))
+        self.assertEqual(a7["stored_path"], glued_path)
+        self.assertEqual(a7["width"], 1846)
+        cur = app.db.one(
+            "SELECT kind FROM frame_versions WHERE frame_id=? AND is_current=1", (f7["id"],))
+        self.assertEqual(cur["kind"], "original")
+        self.assertEqual(app.db.one(
+            "SELECT COUNT(*) c FROM frame_versions WHERE frame_id=? AND kind='boundary'",
+            (f8["id"],))["c"], 0)
+        self.assertEqual(app.db.one("SELECT COUNT(*) c FROM frame_versions")["c"], fver_before)
+        # 操作批次、来源、文件均清理
+        self.assertEqual(app.db.one("SELECT COUNT(*) c FROM boundary_ops")["c"], 0)
+        self.assertEqual(app.db.one("SELECT COUNT(*) c FROM frame_sources WHERE reel_id=?",
+                                   (self.rid,))["c"], 0)
+        self.assertEqual(os.listdir(bdir), [])
+        # 失败的拆分修订被清掉，只保留既有的旋转修订，且仍可撤销
+        rev_actions_after = [r["action"] for r in app.db.q(
+            "SELECT action FROM revisions WHERE reel_id=? ORDER BY id", (self.rid,))]
+        self.assertEqual(rev_actions_after, rev_actions_before)
+        u = self.c.post("/api/reels/%d/undo" % self.rid)
+        self.assertEqual(u.status_code, 200)
+        self.assertEqual(app.db.one("SELECT rotation FROM frames WHERE id=?",
+                                    (f5["id"],))["rotation"], 0)
+
     def test_placeholder_and_cross_reel_blocked(self):
         st = self._state()
         f8 = self._frame(st, "8")
