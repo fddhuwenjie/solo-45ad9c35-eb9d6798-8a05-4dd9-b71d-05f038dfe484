@@ -82,7 +82,11 @@ CREATE TABLE IF NOT EXISTS rescan_items (
     block_reason TEXT DEFAULT '',
     decision_note TEXT DEFAULT '',
     decided_at REAL DEFAULT 0,
-    seq INTEGER NOT NULL DEFAULT 0
+    seq INTEGER NOT NULL DEFAULT 0,
+    reg_status TEXT DEFAULT '',          -- 配准核对：ok/low/failed/no_original（''=尚未核对）
+    reg_detail TEXT DEFAULT '',          -- JSON：最佳变换、各项指标、自动/人工
+    reg_manual INTEGER NOT NULL DEFAULT 0,
+    force_reason TEXT DEFAULT ''         -- 单项强制接受理由（低置信/失败/无原图时必填）
 );
 CREATE TABLE IF NOT EXISTS frame_versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,6 +159,15 @@ class DB:
         fv_cols = {r["name"] for r in self.q("PRAGMA table_info(frame_versions)")}
         if "op_id" not in fv_cols:
             self.conn.execute("ALTER TABLE frame_versions ADD COLUMN op_id INTEGER")
+        ri_cols = {r["name"] for r in self.q("PRAGMA table_info(rescan_items)")}
+        if "reg_status" not in ri_cols:
+            self.conn.execute("ALTER TABLE rescan_items ADD COLUMN reg_status TEXT DEFAULT ''")
+        if "reg_detail" not in ri_cols:
+            self.conn.execute("ALTER TABLE rescan_items ADD COLUMN reg_detail TEXT DEFAULT ''")
+        if "reg_manual" not in ri_cols:
+            self.conn.execute("ALTER TABLE rescan_items ADD COLUMN reg_manual INTEGER NOT NULL DEFAULT 0")
+        if "force_reason" not in ri_cols:
+            self.conn.execute("ALTER TABLE rescan_items ADD COLUMN force_reason TEXT DEFAULT ''")
 
     def q(self, sql, args=()):
         return self.conn.execute(sql, args).fetchall()

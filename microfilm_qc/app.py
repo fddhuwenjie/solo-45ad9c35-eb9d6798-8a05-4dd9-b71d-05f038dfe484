@@ -212,7 +212,9 @@ def rollback_rescan(extra):
         if not item:
             continue
         if op["op"] == "accept":
-            db.run("UPDATE rescan_items SET status='pending', decision_note='', decided_at=0 WHERE id=?",
+            # 仅回滚接受状态；配准核对记录（reg_status/reg_detail/reg_manual/force_reason）
+            # 必须保留——撤销接受是为了重新决定，不应丢失已完成的图像核对证据。
+            db.run("UPDATE rescan_items SET status='pending', decided_at=0 WHERE id=?",
                    (op["item_id"],))
             # 新版本失效，原版本（若有）恢复当前
             db.run("""UPDATE frame_versions SET is_current=0
@@ -666,9 +668,11 @@ def rescan_accept(item_id):
     b = _rescan_batch_or_404(it["batch_id"])
     body = request.get_json(force=True, silent=True) or {}
     note = body.get("note", "")
+    force_reason = str(body.get("force_reason", "") or "").strip()
     db.save_revision(b["reel_id"], "接受补扫回填 No.%s" % it["frame_no"])
     try:
-        reel_id, frame_id, extra = rescan.accept_item(db, item_id, note=note)
+        reel_id, frame_id, extra = rescan.accept_item(
+            db, item_id, note=note, force_reason=force_reason)
     except ValueError as ex:
         db.run("DELETE FROM revisions WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
                (b["reel_id"],))
@@ -728,15 +732,96 @@ def rescan_rebind(item_id):
 def rescan_accept_clean(batch_id):
     b = _rescan_batch_or_404(batch_id)
     reel_id = b["reel_id"]
-    db.save_revision(reel_id, "批量接受补扫批次「%s」无冲突项" % b["name"])
-    _rid, changed, extra, errors = rescan.accept_clean(db, batch_id)
+    db.save_revision(reel_id, "批量接受补扫批次「%s」配准通过项" % b["name"])
+    _rid, changed, extra, report = rescan.accept_clean(db, batch_id)
+    errors, skipped = report["errors"], report["skipped"]
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     if changed:
         analysis.recheck(db, reel_id, changed)
     db.run("UPDATE revisions SET extra=? WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
            (json.dumps(extra, ensure_ascii=False), reel_id))
     return jsonify({"detail": rescan.batch_detail(db, batch_id),
-                    "errors": errors, "state": state(reel_id)})
+                    "errors": errors, "skipped": skipped, "state": state(reel_id)})
+
+
+@app.route("/api/rescan-items/<int:item_id>/registration", methods=["POST"])
+def rescan_recompute_registration(item_id):
+    """人工微调对齐：按给定旋转/平移重算配准指标并落库（核对记录随之更新）。"""
+    it = db.one("SELECT * FROM rescan_items WHERE id=?", (item_id,))
+    if not it:
+        abort(404, "条目不存在")
+    _rescan_batch_or_404(it["batch_id"])
+    body = request.get_json(force=True, silent=True) or {}
+    manual = None
+    # 已接受/已拒绝条目的核对记录作为审计证据冻结，只允许查看（改绑/拒绝时另行重算）
+    if it["status"] in ("accepted", "rejected"):
+        abort(400, "该条目已处理，核对记录已冻结；如需重新配准请先撤销或改绑")
+    if body.get("manual"):
+        try:
+            rotation = int(body.get("rotation", 0))
+            dx = int(round(float(body.get("dx_full", 0))))
+            dy = int(round(float(body.get("dy_full", 0))))
+        except (TypeError, ValueError):
+            abort(400, "旋转/平移参数无效")
+        manual = (rotation, dx, dy)
+    try:
+        _status, detail = rescan.compute_registration(db, item_id, manual=manual)
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 400
+    return jsonify({"detail": rescan.batch_detail(db, it["batch_id"]),
+                    "registration": detail})
+
+
+@app.route("/api/rescan-items/<int:item_id>/registration.<fmt>")
+def rescan_registration_image(item_id, fmt):
+    """配准可视化：overlay=叠加（blend 滑杆）、diff=差异图、new=对齐后补扫图。"""
+    it = db.one("SELECT * FROM rescan_items WHERE id=?", (item_id,))
+    if not it:
+        abort(404, "条目不存在")
+    _rescan_batch_or_404(it["batch_id"])
+    fmt = fmt.lower()
+    if fmt not in ("overlay", "diff", "new", "jpg", "jpeg"):
+        abort(404, "图像类型无效")
+    if not it["file_id"]:
+        abort(400, "该条目没有补扫文件")
+    rf = db.one("SELECT * FROM rescan_files WHERE id=?", (it["file_id"],))
+    reg = {}
+    if it["reg_detail"]:
+        try:
+            reg = json.loads(it["reg_detail"])
+        except ValueError:
+            reg = {}
+    batch = db.one("SELECT * FROM rescan_batches WHERE id=?", (it["batch_id"],))
+    frame = rescan._target_frame_for_reg(db, batch["reel_id"], dict(it))
+    if not frame or frame["placeholder"] or not frame["stored_path"]:
+        abort(404, "无原图可比（缺帧占位条目没有叠加图）")
+    w = max(200, min(1600, int(request.args.get("w", 900))))
+    blend = max(0.0, min(1.0, float(request.args.get("blend", 0.5))))
+    # 前端微调过程中可带实时参数预览（未落库）
+    try:
+        live_rot = int(request.args.get("rotation", reg.get("rotation", 0)))
+        live_dx = int(round(float(request.args.get("dx_full", reg.get("dx_full", 0)))))
+        live_dy = int(round(float(request.args.get("dy_full", reg.get("dy_full", 0)))))
+    except (TypeError, ValueError):
+        live_rot, live_dx, live_dy = reg.get("rotation", 0), reg.get("dx_full", 0), reg.get("dy_full", 0)
+    reg = dict(reg)
+    reg.update({"rotation": live_rot, "dx_full": live_dx, "dy_full": live_dy})
+    from qc_core import register as regmod
+    with Image_open(rf["stored_path"]) as new_img, Image_open(frame["stored_path"]) as ref_img:
+        ref_im = imaging.apply_rotation(ref_img.convert("RGB"), frame["rotation"])
+        new_im = new_img.convert("RGB")
+        if fmt in ("diff",):
+            data = regmod.diff_jpeg(ref_im, new_im, reg, out_w=w)
+        elif fmt in ("new",):
+            data = regmod.aligned_new(ref_im, new_im, reg, out_w=w)
+        else:
+            data = regmod.overlay_jpeg(ref_im, new_im, reg, out_w=w, blend=blend)
+    return send_file(io.BytesIO(data), mimetype="image/jpeg")
+
+
+def Image_open(path):
+    from PIL import Image
+    return Image.open(path)
 
 
 @app.route("/api/rescan-files/<int:file_id>/thumb")

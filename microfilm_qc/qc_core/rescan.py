@@ -16,7 +16,9 @@ import re
 import time
 import zipfile
 
-from . import imaging
+from PIL import Image
+
+from . import imaging, register
 from .analysis import DUP_HAMMING, BLANK_INK
 
 IMG_EXT = {".tif", ".tiff", ".jpg", ".jpeg"}
@@ -81,6 +83,64 @@ def _eligible(frame):
     """只匹配缺帧占位或已标记重拍的帧。"""
     return bool(frame) and (frame["placeholder"] or frame["reshoot"])
 
+
+# ---------------------------------------------------------------- 配准核对
+
+def _target_frame_for_reg(db, reel_id, item):
+    frame = None
+    if item.get("target_frame_id"):
+        frame = db.one("SELECT * FROM frames WHERE id=?", (item["target_frame_id"],))
+    if not frame and item.get("frame_no"):
+        frame = _target_frame(db, reel_id, item["frame_no"])
+    return frame
+
+
+def compute_registration(db, item_id, manual=None):
+    """对补扫文件与原帧做配准核对并落库，返回 (reg_status, reg_detail_dict)。
+
+    manual=(rotation,dx_full,dy_full) 为人工微调（原图像素坐标）；为空时自动四方向配准。
+    无原图可比（缺帧占位/目标不存在）给出 no_original 状态。
+    """
+    it = db.one("SELECT * FROM rescan_items WHERE id=?", (item_id,))
+    if not it:
+        raise ValueError("条目不存在")
+    batch = db.one("SELECT * FROM rescan_batches WHERE id=?", (it["batch_id"],))
+    detail = {"at": time.time(), "auto": manual is None}
+    status = register.STATUS_FAILED
+    rf = db.one("SELECT * FROM rescan_files WHERE id=?", (it["file_id"],)) if it["file_id"] else None
+    frame = _target_frame_for_reg(db, batch["reel_id"], dict(it))
+    if not rf or not os.path.exists(rf["stored_path"]):
+        status = register.STATUS_FAILED
+        detail["message"] = "补扫文件缺失，无法配准"
+    elif not frame or frame["placeholder"] or not frame["stored_path"] or not os.path.exists(frame["stored_path"]):
+        status = register.STATUS_NO_ORIGINAL
+        detail["message"] = ("目标为缺帧占位，没有原图可比" if frame and frame["placeholder"]
+                             else "目标帧无原图，无法比对")
+        if rf:
+            detail["new_wh"] = [rf["width"], rf["height"]]
+    else:
+        with Image.open(rf["stored_path"]) as new_img, \
+                Image.open(frame["stored_path"]) as ref_img:
+            ref_im = imaging.apply_rotation(ref_img.convert("RGB"), frame["rotation"])
+            new_im = new_img.convert("RGB")
+            if manual is None:
+                reg = register.register(ref_im, new_im)
+            else:
+                rot0, dxf, dyf = manual
+                scale = register.WORK_LONG / max(ref_im.size)
+                m = (rot0, int(round(dxf * scale)), int(round(dyf * scale)))
+                reg = register.register(ref_im, new_im, manual=m)
+            reg = register.full_translation(reg)
+        status = register.classify(reg)
+        detail.update(reg)
+        detail["message"] = register.STATUS_LABEL[status]
+    detail["status"] = status
+    db.run("UPDATE rescan_items SET reg_status=?, reg_detail=?, reg_manual=? WHERE id=?",
+           (status, json.dumps(detail, ensure_ascii=False), 0 if manual is None else 1, item_id))
+    return status, detail
+
+
+# ---------------------------------------------------------------- 批次导入
 
 def import_batch(db, root, reel_id, reel_no, name, zip_bytes, entries, note=""):
     """落盘补扫文件、建条目并做拦截校验。返回 batch_id。"""
@@ -204,6 +264,14 @@ def import_batch(db, root, reel_id, reel_no, name, zip_bytes, entries, note=""):
         items.append({"id": cur.lastrowid, "reel_no": reel_no, "frame_no": "",
                       "filename": base, "file_id": fid, "status": STATUS_BLOCKED,
                       "block_reason": reason})
+
+    # 5) 自动图像配准核对（有文件、能定位原帧的条目；尽力而为，不影响导入结果）
+    for it in db.q("SELECT id FROM rescan_items WHERE batch_id=? AND file_id IS NOT NULL",
+                   (batch_id,)):
+        try:
+            compute_registration(db, it["id"])
+        except Exception:
+            continue
 
     return batch_id
 
@@ -351,6 +419,38 @@ def _mad(a, b):
     return round(imaging.cvec_mad(a, b), 2)
 
 
+def reg_info(row):
+    """把 rescan_items 行里的配准核对列解析为前端需要的结构。"""
+    status = row["reg_status"] if "reg_status" in row.keys() else ""
+    if not status:
+        return None
+    info = {"status": status, "status_label": register.STATUS_LABEL.get(status, status),
+            "manual": bool(row["reg_manual"]) if "reg_manual" in row.keys() else False,
+            "force_reason": row["force_reason"] if "force_reason" in row.keys() else ""}
+    raw = row["reg_detail"] if "reg_detail" in row.keys() else ""
+    if raw:
+        try:
+            d = json.loads(raw)
+            for k in ("rotation", "dx", "dy", "dx_full", "dy_full", "iou", "edge_frac",
+                      "lum_mad", "auto", "message", "scale", "ref_wh", "new_wh"):
+                if k in d:
+                    info[k] = d[k]
+        except ValueError:
+            pass
+    return info
+
+
+def batch_accept_blocked(reg_status):
+    """低于阈值/配准失败/无原图可比的条目不得批量接受。"""
+    return reg_status in (register.STATUS_LOW, register.STATUS_FAILED,
+                          register.STATUS_NO_ORIGINAL)
+
+
+def needs_force_reason(reg_status):
+    """单项接受时必须填写强制理由的核对状态。"""
+    return batch_accept_blocked(reg_status)
+
+
 def batch_detail(db, batch_id):
     b = db.one("SELECT * FROM rescan_batches WHERE id=?", (batch_id,))
     if not b:
@@ -375,6 +475,7 @@ def batch_detail(db, batch_id):
             "block_reason": d["block_reason"], "decision_note": d["decision_note"],
             "decided_at": d["decided_at"], "file_id": d["file_id"],
             "target_frame_id": target["id"] if target else None,
+            "reg": reg_info(d),
         }
         if rf:
             entry["new"] = {
@@ -455,8 +556,12 @@ def _refresh_eligibility(db, item):
     return frame, None
 
 
-def accept_item(db, item_id, note=""):
-    """接受单个条目。返回 (reel_id, frame_id, extra)；失败抛 ValueError。"""
+def accept_item(db, item_id, note="", force_reason=""):
+    """接受单个条目。返回 (reel_id, frame_id, extra)；失败抛 ValueError。
+
+    配准核对门禁：低置信(low)/配准失败(failed)/无原图可比(no_original) 的条目，
+    必须提供非空 force_reason（单项强制接受理由）才能接受。
+    """
     it = db.one("SELECT * FROM rescan_items WHERE id=?", (item_id,))
     if not it:
         raise ValueError("条目不存在")
@@ -466,6 +571,11 @@ def accept_item(db, item_id, note=""):
         raise ValueError("已拦截条目不能直接接受，请改绑后再接受或予以拒绝")
     if it["status"] == STATUS_REJECTED:
         raise ValueError("已拒绝的条目请改绑后再接受，或重新导入")
+    reg_status = it["reg_status"] or ""
+    if needs_force_reason(reg_status) and not (force_reason or "").strip():
+        raise ValueError("配准核对为「%s」，不能直接接受；请先人工核对，"
+                         "确认内容一致时填写强制接受理由"
+                         % register.STATUS_LABEL.get(reg_status, reg_status))
     frame, err = _refresh_eligibility(db, it)
     if err:
         raise ValueError(err)
@@ -496,8 +606,9 @@ def accept_item(db, item_id, note=""):
         (rf["filename"], rf["stored_path"], rf["width"], rf["height"], rf["phash"],
          rf["cvec"], rf["brightness"], rf["ink"], rf["orient_score"], frame["id"]))
 
-    db.run("UPDATE rescan_items SET status=?, decision_note=?, decided_at=? WHERE id=?",
-           (STATUS_ACCEPTED, note, time.time(), item_id))
+    db.run(
+        "UPDATE rescan_items SET status=?, decision_note=?, force_reason=?, decided_at=? WHERE id=?",
+        (STATUS_ACCEPTED, note, (force_reason or "").strip(), time.time(), item_id))
 
     extra = {"rescan": [{
         "op": "accept", "item_id": item_id, "frame_id": frame["id"],
@@ -523,7 +634,6 @@ def reject_item(db, item_id, note=""):
                          "decision_note": it["decision_note"]}]}
     # 返回值第一项必须是 reel_id（不能用 batch_id 代替），否则修订与撤销会挂错卷
     return batch["reel_id"], None, extra
-
 
 def rebind_item(db, item_id, new_frame_no, note=""):
     """改绑到同卷另一个占位/重拍帧。"""
@@ -563,6 +673,12 @@ def rebind_item(db, item_id, new_frame_no, note=""):
     db.run(
         "UPDATE rescan_items SET target_frame_id=?, frame_no=?, status=?, block_reason=?, decision_note=?, decided_at=? WHERE id=?",
         (target["id"], new_frame_no, STATUS_PENDING, "", note, time.time(), item_id))
+    # 改绑目标变化 -> 重新配准核对；清除旧的强制接受理由
+    try:
+        compute_registration(db, item_id)
+    except Exception:
+        pass
+    db.run("UPDATE rescan_items SET force_reason='' WHERE id=?", (item_id,))
     extra = {"rescan": [{"op": "decide", "item_id": item_id, "status": old_status,
                          "block_reason": old_reason, "decision_note": it["decision_note"],
                          "old_target_frame_id": old_target, "old_frame_no": it["frame_no"]}]}
@@ -570,15 +686,28 @@ def rebind_item(db, item_id, new_frame_no, note=""):
 
 
 def accept_clean(db, batch_id):
-    """批量接受全部无冲突待处理项。返回 (reel_id, [frame_ids], extra)。"""
+    """批量接受全部“无冲突且配准核对通过”的待处理项。
+
+    低于阈值(low)/配准失败(failed)/无原图可比(no_original) 不得批量接受，
+    记入 skipped 返回给前端引导人工单项处理。
+    返回 (reel_id, [frame_ids], extra, {"errors":[...], "skipped":[...]})。
+    """
     items = db.q(
         "SELECT id FROM rescan_items WHERE batch_id=? AND status='pending' ORDER BY seq, id",
         (batch_id,))
-    changed, ops, errors = [], [], []
+    changed, ops, errors, skipped = [], [], [], []
     reel_id = None
     for r in items:
+        it = db.one("SELECT * FROM rescan_items WHERE id=?", (r["id"],))
+        reg_status = it["reg_status"] or ""
+        if batch_accept_blocked(reg_status):
+            skipped.append({"item_id": r["id"], "frame_no": it["frame_no"],
+                            "filename": it["filename"],
+                            "reg_status": reg_status,
+                            "reason": register.STATUS_LABEL.get(reg_status, reg_status)})
+            continue
         try:
-            rid, fid, extra = accept_item(db, r["id"], note="批量接受无冲突项")
+            rid, fid, extra = accept_item(db, r["id"], note="批量接受（配准核对通过）")
             reel_id = rid
             changed.append(fid)
             ops.extend(extra["rescan"])
@@ -587,7 +716,7 @@ def accept_clean(db, batch_id):
     if reel_id is None:
         b = db.one("SELECT reel_id FROM rescan_batches WHERE id=?", (batch_id,))
         reel_id = b["reel_id"] if b else None
-    return reel_id, changed, {"rescan": ops}, errors
+    return reel_id, changed, {"rescan": ops}, {"errors": errors, "skipped": skipped}
 
 
 # ---------------------------------------------------------------- 导出
@@ -600,7 +729,7 @@ def batch_export_json(db, batch_id):
         "unused_files": detail["unused_files"],
         "items": [{k: v for k, v in it.items() if k in (
             "seq", "reel_no", "frame_no", "filename", "status", "status_label",
-            "block_reason", "decision_note", "old", "new", "continuity")}
+            "block_reason", "decision_note", "old", "new", "continuity", "reg")}
             for it in detail["items"]],
     }
 
@@ -609,11 +738,19 @@ def decisions_csv(db, batch_id):
     detail = batch_detail(db, batch_id)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["reel_no", "原帧号", "补扫文件", "处理结果", "拦截/备注原因", "处理时间"])
+    w.writerow(["reel_no", "原帧号", "补扫文件", "处理结果", "配准状态",
+                "旋转°", "平移dx", "平移dy", "结构相似度IoU", "未重合边缘",
+                "亮度差MAD", "人工微调", "强制接受理由", "拦截/备注原因", "处理时间"])
     for it in detail["items"]:
+        reg = it.get("reg") or {}
         w.writerow([
             it["reel_no"], it["frame_no"], it["filename"],
-            it["status_label"], it["block_reason"] or it["decision_note"] or "",
+            it["status_label"], reg.get("status_label", ""),
+            reg.get("rotation", ""), reg.get("dx_full", ""), reg.get("dy_full", ""),
+            reg.get("iou", ""), reg.get("edge_frac", ""), reg.get("lum_mad", ""),
+            "是" if reg.get("manual") else ("否" if reg else ""),
+            reg.get("force_reason", ""),
+            it["block_reason"] or it["decision_note"] or "",
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(it["decided_at"]))
             if it["decided_at"] else "",
         ])

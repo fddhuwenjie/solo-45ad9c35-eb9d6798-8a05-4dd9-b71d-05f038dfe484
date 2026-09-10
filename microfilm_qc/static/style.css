@@ -203,6 +203,47 @@ button.ghost { background: transparent; }
            pointer-events: none; color: var(--ok); font-size: 15px; text-shadow: 0 1px 4px #000; }
 @media (max-width: 900px) { .rb-sides { grid-template-columns: 1fr; } }
 
+/* ---------------- 补扫图像配准核对 ---------------- */
+.rb-reg {
+  border: 1px solid var(--border); border-radius: 8px;
+  background: #1d2026; margin: 8px 0 4px; padding: 8px 10px;
+}
+.rb-reg-head { font-size: 13px; color: var(--accent); display: flex; align-items: center; gap: 8px; }
+.rb-reg-badge { font-size: 11px; padding: 2px 10px; border-radius: 10px; border: 1px solid var(--border); }
+.reg-ok { color: var(--ok); border-color: var(--ok) !important; }
+.reg-low { color: var(--warn); border-color: var(--warn) !important; }
+.reg-failed, .reg-fail { color: var(--danger); border-color: var(--danger) !important; }
+.reg-no_original, .reg-none { color: #7fc0e6; border-color: #5aa7d4 !important; }
+.rb-reg-stats { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px;
+                color: var(--muted); margin: 6px 0 8px; }
+.rb-reg-stats b { color: var(--text); }
+.rb-reg-stats .good { color: var(--ok); }
+.rb-reg-stats .bad { color: var(--danger); }
+.rb-reg-viewer { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 12px;
+                 border-top: 1px solid var(--border); padding-top: 8px; }
+@media (max-width: 900px) { .rb-reg-viewer { grid-template-columns: 1fr; } }
+.rb-reg-canvas { background: #000; border-radius: 6px; min-height: 200px;
+                 display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.rb-reg-canvas img { width: 100%; max-height: 460px; object-fit: contain; display: block; }
+.rb-reg-controls { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 8px; }
+.rb-reg-tabs { display: flex; gap: 4px; }
+.rb-reg-tabs button { font-size: 12px; padding: 4px 10px; }
+.rb-reg-tabs button.active { border-color: var(--accent); color: var(--accent); }
+.rb-slider { display: flex; flex-direction: column; gap: 4px; }
+.rb-slider input[type=range] { width: 100%; }
+.rb-nudge { border-top: 1px dashed var(--border); padding-top: 8px; display: flex;
+            flex-direction: column; gap: 6px; align-items: stretch; }
+.rb-nudge-grid { display: grid; grid-template-columns: repeat(3, 34px); gap: 4px; justify-content: center; }
+.rb-nudge-grid button { padding: 4px 0; font-size: 13px; }
+.rb-nudge-center { text-align: center; color: var(--muted); line-height: 28px; }
+.rb-nudge-info { font-size: 11px; color: var(--muted); text-align: center; }
+.rb-nudge button.rb-recompute { font-size: 12px; border-color: var(--accent); color: var(--accent); }
+.rb-reg-none { font-size: 12px; color: var(--muted); background: rgba(90,167,212,.08);
+               border: 1px dashed #5aa7d4; border-radius: 6px; padding: 8px 10px; margin-top: 6px; }
+.rb-force { margin: 6px 2px; font-size: 12px; color: var(--warn);
+            background: rgba(224,179,76,.1); border-radius: 6px; padding: 6px 10px; }
+.warn-text { color: var(--warn); font-weight: 600; }
+
 /* ---------------- 帧边界复核 ---------------- */
 .strip-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
 .boundary-panel h4 { margin: 6px 0; font-size: 13px; color: var(--muted); }
