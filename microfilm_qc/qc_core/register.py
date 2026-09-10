@@ -96,8 +96,8 @@ def _row_window(stride, x0, y0, x1, y1):
 
 # ---------------------------------------------------------------- 配准搜索
 
-def _search_direction(rm, nm):
-    """在一个旋转方向上做两级（粗+精）平移搜索，返回 (dx, dy, iou) 或 None。
+def _prepare_direction(rm, nm):
+    """把 ref/new 掩码贴到同宽公共画布并打包，返回 (状态dict, eval_at(dx,dy))。
 
     ref/new 旋转后可能尺寸/行宽不同，不能直接对不同 stride 的位图做移位与；
     先把两张掩码贴到 *同一宽度* 的公共画布（四周留 SEARCH 余量），再按统一行宽打包。
@@ -109,21 +109,22 @@ def _search_direction(rm, nm):
     cw = max(rw0, nw0) + 2 * M
     ch = max(rh0, nh0) + 2 * M
 
-    def raster(mask, w, h):
+    def raster(mask):
         c = Image.new("1", (cw, ch), 0)
         c.paste(mask, (M, M))
         return c
 
-    rc = raster(rm, rw0, rh0)
-    nc = raster(nm, nw0, nh0)
+    rc = raster(rm)
+    nc = raster(nm)
     rv, rw, rh, rs = _pack(rc)
     nv, nw, nh, ns = _pack(nc)
     assert rs == ns
     stride = rs
     rcount = _pack(rm)[0].bit_count()
     ncount = _pack(nm)[0].bit_count()
-    if rcount < MIN_INK or ncount < MIN_INK:
-        return None
+
+    state = {"stride": stride, "rv": rv, "nv": nv, "rcount": rcount,
+             "ncount": ncount, "rw0": rw0, "rh0": rh0, "nw0": nw0, "nh0": nh0}
 
     def eval_at(dx, dy):
         # 画布坐标：ref 原点 (M,M)；new 原点 (M+dx, M+dy)
@@ -140,6 +141,17 @@ def _search_direction(rm, nm):
         n_in = sw.bit_count()
         union = rcount + n_in - inter
         return inter / union if union > 0 else 0.0
+
+    state["eval_at"] = eval_at
+    return state
+
+
+def _search_direction(rm, nm):
+    """在一个旋转方向上做两级（粗+精）平移搜索，返回 (dx, dy, iou) 或 None。"""
+    state = _prepare_direction(rm, nm)
+    if state["rcount"] < MIN_INK or state["ncount"] < MIN_INK:
+        return None
+    eval_at = state["eval_at"]
 
     best = None
     for dy in range(-SEARCH, SEARCH + 1, COARSE):
@@ -159,6 +171,15 @@ def _search_direction(rm, nm):
             if jac is not None and jac > fine[2]:
                 fine = (dx, dy, jac)
     return fine
+
+
+def _evaluate_transform(rm, nm, dx, dy):
+    """严格按用户提交的位移评估，不重新搜索。返回 iou（无重叠/墨迹为空返回 0.0）。"""
+    state = _prepare_direction(rm, nm)
+    if state["rcount"] < MIN_INK or state["ncount"] < MIN_INK:
+        return 0.0
+    jac = state["eval_at"](int(dx), int(dy))
+    return 0.0 if jac is None else jac
 
 
 def _geometry_edge(new0, dx, dy, ref_w, ref_h):
@@ -182,7 +203,11 @@ def _lum_mad(ref_im, new_im, dx, dy):
 
 
 def register(ref_img, new_img, manual=None):
-    """对一对图像做四方向配准。manual=(rotation,dx,dy) 时只在该变换附近精搜（人工微调）。
+    """对一对图像做配准。
+
+    manual=None：四方向 × 有限平移自动搜索最佳变换。
+    manual=(rotation, dx_full, dy_full)：人工微调，严格按用户提交的旋转与位移
+      （原图像素坐标）评估 IoU/边缘/亮度，*不重新搜索、不覆盖位移*。
 
     返回 dict：rotation/dx/dy（工作像素）/iou/edge_frac/lum_mad/
     ref_wh/new_wh/scale/auto（是否自动搜索）。
@@ -195,13 +220,13 @@ def register(ref_img, new_img, manual=None):
         rotation = int(manual[0])
         if rotation not in ROTATIONS:
             rotation = 0
+        # 用户位移按原图像素提交，换算到工作像素；保持用户给定值，不做搜索
+        dx_full, dy_full = int(round(float(manual[1]))), int(round(float(manual[2])))
+        dx = int(round(dx_full * scale))
+        dy = int(round(dy_full * scale))
         new = _prep(new_img, scale, rotation)
         nm = ink_mask(new)
-        hit = _search_direction(rm, nm)
-        if hit is None:
-            dx, dy, iou = int(manual[1]), int(manual[2]), 0.0
-        else:
-            dx, dy, iou = hit
+        iou = _evaluate_transform(rm, nm, dx, dy)
         auto = False
     else:
         best = None
@@ -215,7 +240,7 @@ def register(ref_img, new_img, manual=None):
             # 四方向全部配不上：掩码为空或重叠不足
             cand0 = _prep(new_img, scale, 0)
             return {
-                "rotation": 0, "dx": 0, "dy": 0, "iou": 0.0,
+                "rotation": 0, "dx": 0, "dy": 0, "dx_full": 0, "dy_full": 0, "iou": 0.0,
                 "edge_frac": round(_geometry_edge(cand0, 0, 0, ref.width, ref.height), 4),
                 "lum_mad": round(_lum_mad(ref, cand0, 0, 0), 2),
                 "ref_wh": [ref.width, ref.height], "new_wh": [cand0.width, cand0.height],
@@ -226,8 +251,12 @@ def register(ref_img, new_img, manual=None):
 
     edge_frac = _geometry_edge(new, dx, dy, ref.width, ref.height)
     lum = _lum_mad(ref, new, dx, dy)
+    if auto:
+        dx_full = int(round(dx / scale))
+        dy_full = int(round(dy / scale))
     return {
-        "rotation": rotation, "dx": int(dx), "dy": int(dy), "iou": round(iou, 4),
+        "rotation": rotation, "dx": int(dx), "dy": int(dy),
+        "dx_full": dx_full, "dy_full": dy_full, "iou": round(iou, 4),
         "edge_frac": round(edge_frac, 4), "lum_mad": round(lum, 2),
         "ref_wh": [ref.width, ref.height], "new_wh": [new.width, new.height],
         "scale": scale, "auto": auto,
@@ -304,9 +333,16 @@ def _composite(ref_img, new_img, reg, out_w, mode="overlay", blend=0.5):
 
 
 def full_translation(reg):
-    """把工作像素平移换算为原图像素（供存储与前端按原始坐标理解）。"""
+    """把工作像素平移换算为原图像素（供存储与前端按原始坐标理解）。
+
+    人工微调(auto=False)已带用户提交的原图像素位移，保持不变，避免取整往返误差。
+    """
     scale = reg.get("scale", 1.0) or 1.0
     reg = dict(reg)
-    reg["dx_full"] = int(round(reg["dx"] / scale))
-    reg["dy_full"] = int(round(reg["dy"] / scale))
+    if not reg.get("auto") and "dx_full" in reg and "dy_full" in reg:
+        reg["dx_full"] = int(round(reg["dx_full"]))
+        reg["dy_full"] = int(round(reg["dy_full"]))
+    else:
+        reg["dx_full"] = int(round(reg["dx"] / scale))
+        reg["dy_full"] = int(round(reg["dy"] / scale))
     return reg

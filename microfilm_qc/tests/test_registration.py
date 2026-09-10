@@ -65,10 +65,37 @@ class RegistrationAlgorithmTests(unittest.TestCase):
         self.assertIn(regmod.classify(reg),
                       (regmod.STATUS_LOW, regmod.STATUS_FAILED))
 
-    def test_manual_nudge_recomputes_nearby(self):
-        # 给同页一个偏移初值，人工微调应在附近精搜回最优
-        reg = regmod.register(self.pages[10], self.pages[10], manual=(0, 10, 10))
+    def test_manual_transform_is_evaluated_exactly_as_submitted(self):
+        # 人工微调必须按用户提交的 rotation/dx/dy 评估，不能重新搜索覆盖位移。
+        # 同页图像在明显偏移处 IoU 应随之下降，且返回位移必须等于提交值（换算取整）。
+        dx_full, dy_full = 60, 40
+        reg = regmod.register(self.pages[10], self.pages[10],
+                              manual=(0, dx_full, dy_full))
+        reg = regmod.full_translation(reg)
         self.assertFalse(reg["auto"])
+        # 返回的原图像素位移即用户提交值
+        self.assertEqual(reg["dx_full"], dx_full)
+        self.assertEqual(reg["dy_full"], dy_full)
+        # 偏移后不再是高重合（自动搜索若生效会把 IoU 拉回 ~1.0）
+        self.assertLess(reg["iou"], 0.85)
+
+    def test_manual_rotation_is_kept_without_search_override(self):
+        # 同页图像旋转 180 后，人工坚持 0° 评估，结果应保持 0°（不自动选回 180°）
+        flipped = self.pages[10].rotate(180)
+        reg = regmod.register(self.pages[10], flipped, manual=(0, 0, 0))
+        self.assertEqual(reg["rotation"], 0)
+        self.assertFalse(reg["auto"])
+        self.assertLess(reg["iou"], regmod.IOU_PASS)
+        # 同一对图自动搜索能找到 180°
+        auto = regmod.register(self.pages[10], flipped)
+        self.assertEqual(auto["rotation"], 180)
+        self.assertGreaterEqual(auto["iou"], 0.9)
+
+    def test_manual_zero_transform_matches_auto_identity(self):
+        reg = regmod.full_translation(
+            regmod.register(self.pages[10], self.pages[10], manual=(0, 0, 0)))
+        self.assertFalse(reg["auto"])
+        self.assertEqual((reg["dx_full"], reg["dy_full"]), (0, 0))
         self.assertGreaterEqual(reg["iou"], 0.9)
 
 
@@ -147,6 +174,54 @@ class RegistrationFlowTests(unittest.TestCase):
         for no in skipped:
             self.assertEqual(self._item(no)["status"], "pending")
 
+    def _blank_registration(self, frame_no):
+        """把某条目的配准核对结果清空（模拟未完成核对）。"""
+        it = self._item(frame_no)
+        app.db.run(
+            "UPDATE rescan_items SET reg_status='', reg_detail='', reg_manual=0 WHERE id=?",
+            (it["id"],))
+        return it["id"]
+
+    def test_empty_reg_status_skipped_by_batch_accept(self):
+        # 选一个原本 ok 的待处理项，清空其核对状态
+        item_id = self._blank_registration(13)
+        r = self.c.post("/api/rescans/%d/accept-clean" % self.batch_id)
+        self.assertEqual(r.status_code, 200)
+        skipped = {s["item_id"]: s for s in r.get_json()["skipped"]}
+        self.assertIn(item_id, skipped)
+        self.assertEqual(skipped[item_id]["reg_status"], "")
+        # 未被接受
+        self._refresh()
+        self.assertEqual(next(x for x in self.detail["items"] if x["id"] == item_id)["status"],
+                         "pending")
+
+    def test_empty_reg_status_requires_force_reason(self):
+        item_id = self._blank_registration(13)
+        r = self.c.post("/api/rescan-items/%d/accept" % item_id, json={})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("尚未完成图像配准核对", r.get_json()["error"])
+        r = self.c.post("/api/rescan-items/%d/accept" % item_id,
+                        json={"force_reason": "旧配准数据缺失，已人工逐项核对"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+
+    def test_manual_recompute_keeps_submitted_translation(self):
+        it = self._item(33)  # 有原图可比对
+        dx, dy = 50, -30
+        r = self.c.post("/api/rescan-items/%d/registration" % it["id"],
+                        json={"manual": True, "rotation": 0,
+                              "dx_full": dx, "dy_full": dy})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        reg = r.get_json()["registration"]
+        self.assertTrue(reg["auto"] is False)
+        self.assertEqual(reg["dx_full"], dx)
+        self.assertEqual(reg["dy_full"], dy)
+        self.assertEqual(reg["rotation"], 0)
+        # 落库后详情同样保存用户位移，且标记人工微调
+        out = next(x for x in r.get_json()["detail"]["items"] if x["id"] == it["id"])
+        self.assertEqual(out["reg"]["dx_full"], dx)
+        self.assertEqual(out["reg"]["dy_full"], dy)
+        self.assertTrue(out["reg"]["manual"])
+
     def test_undo_accept_keeps_registration_record(self):
         it = self._item(20)
         reason = "撤销回归：理由不应丢失"
@@ -216,6 +291,24 @@ class RegistrationFlowTests(unittest.TestCase):
         it20 = self._item(20)
         r = self.c.get("/api/rescan-items/%d/registration.overlay" % it20["id"])
         self.assertEqual(r.status_code, 404)
+
+
+class ViewerRebindNodeTests(unittest.TestCase):
+    """换卡后查看器重绑/空状态门禁的原生 JS 回归（用 node 执行，无 node 则跳过）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        cls.node = shutil.which("node")
+        cls.script = os.path.join(ROOT, "tests", "test_rescan_viewer.js")
+
+    def test_rescan_viewer_js(self):
+        if not self.node:
+            self.skipTest("未安装 node，跳过前端查看器重绑回归")
+        import subprocess
+        p = subprocess.run([self.node, self.script], capture_output=True, text=True)
+        if p.returncode != 0:
+            self.fail("前端查看器回归失败：\n" + p.stdout + "\n" + p.stderr)
 
 
 if __name__ == "__main__":

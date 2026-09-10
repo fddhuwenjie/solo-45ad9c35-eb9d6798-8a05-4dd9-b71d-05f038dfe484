@@ -126,10 +126,9 @@ def compute_registration(db, item_id, manual=None):
             if manual is None:
                 reg = register.register(ref_im, new_im)
             else:
-                rot0, dxf, dyf = manual
-                scale = register.WORK_LONG / max(ref_im.size)
-                m = (rot0, int(round(dxf * scale)), int(round(dyf * scale)))
-                reg = register.register(ref_im, new_im, manual=m)
+                # 严格按用户提交的 rotation/dx_full/dy_full 评估与保存，不重新搜索
+                rot0, dxf, dyf = int(manual[0]), int(manual[1]), int(manual[2])
+                reg = register.register(ref_im, new_im, manual=(rot0, dxf, dyf))
             reg = register.full_translation(reg)
         status = register.classify(reg)
         detail.update(reg)
@@ -441,14 +440,19 @@ def reg_info(row):
 
 
 def batch_accept_blocked(reg_status):
-    """低于阈值/配准失败/无原图可比的条目不得批量接受。"""
-    return reg_status in (register.STATUS_LOW, register.STATUS_FAILED,
-                          register.STATUS_NO_ORIGINAL)
+    """不得批量接受的核对状态：低于阈值/配准失败/无原图可比，以及尚未完成核对（空）。
+
+    只有明确「核对一致(ok)」的条目才能批量接受。
+    """
+    return reg_status != register.STATUS_OK
 
 
 def needs_force_reason(reg_status):
-    """单项接受时必须填写强制理由的核对状态。"""
-    return batch_accept_blocked(reg_status)
+    """单项接受时必须填写强制理由的核对状态。
+
+    低置信/失败/无原图/未完成核对（空）都需人工确认；核对一致(ok)可直接接受。
+    """
+    return reg_status != register.STATUS_OK
 
 
 def batch_detail(db, batch_id):
@@ -573,9 +577,10 @@ def accept_item(db, item_id, note="", force_reason=""):
         raise ValueError("已拒绝的条目请改绑后再接受，或重新导入")
     reg_status = it["reg_status"] or ""
     if needs_force_reason(reg_status) and not (force_reason or "").strip():
+        label = (register.STATUS_LABEL.get(reg_status)
+                 if reg_status else "尚未完成图像配准核对")
         raise ValueError("配准核对为「%s」，不能直接接受；请先人工核对，"
-                         "确认内容一致时填写强制接受理由"
-                         % register.STATUS_LABEL.get(reg_status, reg_status))
+                         "确认内容一致时填写强制接受理由" % label)
     frame, err = _refresh_eligibility(db, it)
     if err:
         raise ValueError(err)
@@ -704,7 +709,8 @@ def accept_clean(db, batch_id):
             skipped.append({"item_id": r["id"], "frame_no": it["frame_no"],
                             "filename": it["filename"],
                             "reg_status": reg_status,
-                            "reason": register.STATUS_LABEL.get(reg_status, reg_status)})
+                            "reason": (register.STATUS_LABEL.get(reg_status)
+                                       if reg_status else "尚未完成图像配准核对")})
             continue
         try:
             rid, fid, extra = accept_item(db, r["id"], note="批量接受（配准核对通过）")

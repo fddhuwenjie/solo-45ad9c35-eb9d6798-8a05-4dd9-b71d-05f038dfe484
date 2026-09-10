@@ -22,6 +22,12 @@ function rbRegState(it) {
   return REG_META[r.status] || {label: r.status_label || r.status, cls: "idle"};
 }
 
+function rbRegGated(it) {
+  // 低于阈值/配准失败/无原图，以及未完成核对（空状态）都不可批量接受、单项需填理由
+  const s = it.reg && it.reg.status;
+  return s !== "ok";
+}
+
 function rbRegUI(id) {
   if (!rb.reg[id]) rb.reg[id] = {view: "overlay", blend: 0.5, blink: false, dx_full: 0, dy_full: 0, rotation: 0, dirty: false, busy: false};
   return rb.reg[id];
@@ -101,27 +107,28 @@ function rbRender() {
   const d = rb.detail;
   $("#rbBatchInfo").textContent = rbCountsText(d);
   const c = d.counts;
-  const autoOk = d.items.filter((it) =>
-    it.status === "pending" && it.reg && it.reg.status === "ok").length;
-  const needReview = d.items.filter((it) =>
-    it.status === "pending" && ["low", "failed", "no_original"].includes(it.reg && it.reg.status)).length;
+  const pendingItems = d.items.filter((it) => it.status === "pending");
+  const autoOk = pendingItems.filter((it) => it.reg && it.reg.status === "ok").length;
+  const needReview = pendingItems.filter(rbRegGated).length;
   const btn = $("#btnRbAcceptClean");
   btn.disabled = autoOk === 0;
   btn.textContent = autoOk
     ? `批量接受配准通过项（${autoOk}）`
     : "无配准通过项可批量接受";
   btn.title = needReview
-    ? `另有 ${needReview} 个待处理项低于阈值/配准失败/无原图，需逐项人工核对`
+    ? `另有 ${needReview} 个待处理项低于阈值/配准失败/无原图/尚未核对，需逐项人工确认`
     : "";
   let reviewNote = "";
   if (needReview) {
-    const nLow = d.items.filter((it) => it.status === "pending" && it.reg && it.reg.status === "low").length;
-    const nFail = d.items.filter((it) => it.status === "pending" && it.reg && it.reg.status === "failed").length;
-    const nNone = d.items.filter((it) => it.status === "pending" && it.reg && it.reg.status === "no_original").length;
+    const nLow = pendingItems.filter((it) => it.reg && it.reg.status === "low").length;
+    const nFail = pendingItems.filter((it) => it.reg && it.reg.status === "failed").length;
+    const nNone = pendingItems.filter((it) => it.reg && it.reg.status === "no_original").length;
+    const nIdle = pendingItems.filter((it) => !(it.reg && it.reg.status)).length;
     const parts = [];
     if (nLow) parts.push(`相似度偏低 ${nLow}`);
     if (nFail) parts.push(`配准失败 ${nFail}`);
     if (nNone) parts.push(`无原图可比 ${nNone}`);
+    if (nIdle) parts.push(`尚未核对 ${nIdle}`);
     reviewNote = ` ｜ ⚠ 不得批量接受：${parts.join("、")}`;
   }
   $("#rbRegSummary").textContent = reviewNote;
@@ -183,7 +190,7 @@ function rbCard(it) {
   };
 
   if (it.status === "pending") {
-    const gated = ["low", "failed", "no_original"].includes(it.reg && it.reg.status);
+    const gated = rbRegGated(it);
     if (gated) {
       mk("⚠ 强制接受（需填理由）", "danger", () => rbAccept(it.id, true));
     } else {
@@ -381,10 +388,22 @@ async function rbRecompute(card, it, manual = true) {
     rb.detail = j.detail;
     const fresh = rb.detail.items.find((x) => x.id === it.id);
     ui.dirty = false;
-    rbRenderCard(fresh, card);
+    // 替换卡片后必须重新绑定并渲染查看器，否则叠加/闪烁/差异图与微调控件失效
+    const newCard = rbInternals.renderCard(fresh, card);
+    rbInternals.bindViewer(newCard, fresh);
+    rbInternals.renderViewer(newCard, fresh);
     toast("已按当前对齐重算配准指标");
   } catch (e) { /* toast 已提示 */ } finally { ui.busy = false; }
 }
+
+// 经一层可变引用调用，便于无浏览器环境下的回归测试注入桩件
+const rbInternals = {
+  renderCard: (it, oldCard) => rbRenderCard(it, oldCard),
+  bindViewer: (card, it) => rbBindViewer(card, it),
+  renderViewer: (card, it) => rbRenderViewer(card, it),
+  rbCard: (it) => rbCard(it),
+};
+window.__rbTest = { rbInternals, rbRecompute, rbRegUI };
 
 function rbRenderCard(it, oldCard) {
   const fresh = rbCard(it);
