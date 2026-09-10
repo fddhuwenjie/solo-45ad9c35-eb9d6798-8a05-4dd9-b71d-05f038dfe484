@@ -168,15 +168,7 @@ def import_batch(db, root, reel_id, reel_no, name, zip_bytes, entries, note=""):
             target_claims.setdefault(str(it["frame_no"]), []).append(it["id"])
 
     # 卷内既有文件指纹（含历史版本与其它批次补扫件）
-    occupied_md5 = {}
-    for r in db.q("SELECT md5, filename FROM rescan_files WHERE md5!='' AND batch_id!=?",
-                  (batch_id,)):
-        occupied_md5.setdefault(r["md5"], r["filename"])
-    for r in db.q("SELECT stored_path, filename FROM frames WHERE reel_id=? AND placeholder=0",
-                  (reel_id,)):
-        p = r["stored_path"]
-        if p and os.path.exists(p):
-            occupied_md5.setdefault(_md5_file(p), r["filename"])
+    occupied_md5 = _occupied_md5_map(db, reel_id, batch_id)
 
     blocked_items = []
     for it in items:
@@ -268,21 +260,51 @@ def _validate_item(db, it, reel_id, reel_no, batch_id, zip_infos, dup_basenames,
                 % it["frame_no"])
 
     # g) 同一文件重复占用：与其它批次/当前有效图字节相同
+    reason = _same_file_occupy_reason(db, rf, reel_id, batch_id, base, occupied_md5)
+    if reason:
+        return reason
+
+    # h) 内容重复提交：与卷内任一有效图像近重复
+    return _content_dup_reason(db, rf, reel_id, base)
+
+
+def _occupied_md5_map(db, reel_id, batch_id):
+    """卷内已占用文件的 MD5 -> 文件名（含其它批次补扫件与当前有效图，不含本批次）。"""
+    occupied_md5 = {}
+    for r in db.q("SELECT md5, filename FROM rescan_files WHERE md5!='' AND batch_id!=?",
+                  (batch_id,)):
+        occupied_md5.setdefault(r["md5"], r["filename"])
+    for r in db.q("SELECT stored_path, filename FROM frames WHERE reel_id=? AND placeholder=0",
+                  (reel_id,)):
+        p = r["stored_path"]
+        if p and os.path.exists(p):
+            occupied_md5.setdefault(_md5_file(p), r["filename"])
+    return occupied_md5
+
+
+def _same_file_occupy_reason(db, rf, reel_id, batch_id, base, occupied_md5=None):
+    """同一文件重复占用：与其它批次补扫件或当前有效图字节完全相同。返回原因或 None。"""
+    if occupied_md5 is None:
+        occupied_md5 = _occupied_md5_map(db, reel_id, batch_id)
     if rf["md5"] in occupied_md5:
         return "同一文件重复占用：%s 与已提交/当前有效文件 %s 完全相同" % (
             base, occupied_md5[rf["md5"]])
+    return None
 
-    # h) 内容重复提交：与卷内任一有效图像近重复
-    if rf["phash"] and (rf["ink"] is None or rf["ink"] >= BLANK_INK):
-        newhash = int(rf["phash"], 16)
-        for r in db.q("""SELECT id, frame_no, phash, ink FROM frames
-                         WHERE reel_id=? AND placeholder=0 AND phash!=''""", (reel_id,)):
-            if r["ink"] is not None and r["ink"] < BLANK_INK:
-                continue
-            if imaging.hamming(newhash, int(r["phash"], 16)) <= DUP_HAMMING:
-                return ("重复提交：%s 与卷内 No.%s 当前有效图内容几乎相同（哈希距离 %d）"
-                        % (base, r["frame_no"],
-                           imaging.hamming(newhash, int(r["phash"], 16))))
+
+def _content_dup_reason(db, rf, reel_id, base):
+    """内容重复提交：与卷内任一有效图像近重复（感知哈希距离过近）。返回原因或 None。"""
+    if not (rf["phash"] and (rf["ink"] is None or rf["ink"] >= BLANK_INK)):
+        return None
+    newhash = int(rf["phash"], 16)
+    for r in db.q("""SELECT id, frame_no, phash, ink FROM frames
+                     WHERE reel_id=? AND placeholder=0 AND phash!=''""", (reel_id,)):
+        if r["ink"] is not None and r["ink"] < BLANK_INK:
+            continue
+        dist = imaging.hamming(newhash, int(r["phash"], 16))
+        if dist <= DUP_HAMMING:
+            return ("重复提交：%s 与卷内 No.%s 当前有效图内容几乎相同（哈希距离 %d）"
+                    % (base, r["frame_no"], dist))
     return None
 
 
@@ -491,12 +513,16 @@ def reject_item(db, item_id, note=""):
     it = db.one("SELECT * FROM rescan_items WHERE id=?", (item_id,))
     if not it:
         raise ValueError("条目不存在")
+    batch = db.one("SELECT * FROM rescan_batches WHERE id=?", (it["batch_id"],))
+    if not batch:
+        raise ValueError("条目所属批次不存在")
     db.run("UPDATE rescan_items SET status=?, decision_note=?, decided_at=? WHERE id=?",
            (STATUS_REJECTED, note, time.time(), item_id))
     extra = {"rescan": [{"op": "decide", "item_id": item_id,
                          "status": it["status"], "block_reason": it["block_reason"],
                          "decision_note": it["decision_note"]}]}
-    return it["batch_id"], None, extra
+    # 返回值第一项必须是 reel_id（不能用 batch_id 代替），否则修订与撤销会挂错卷
+    return batch["reel_id"], None, extra
 
 
 def rebind_item(db, item_id, new_frame_no, note=""):
@@ -517,6 +543,20 @@ def rebind_item(db, item_id, new_frame_no, note=""):
         (it["batch_id"], target["id"], item_id))
     if clash:
         raise ValueError("No.%s 已被本批次另一条目占用" % new_frame_no)
+
+    # 改绑必须重新执行文件占用校验：因“同一文件重复占用/内容重复”被拦截的文件，
+    # 不能仅靠改绑变成 pending，再被另一帧接受。
+    if not it["file_id"]:
+        raise ValueError("该条目没有补扫文件，无法改绑")
+    rf = db.one("SELECT * FROM rescan_files WHERE id=?", (it["file_id"],))
+    if not rf:
+        raise ValueError("补扫文件记录缺失，无法改绑")
+    reason = _same_file_occupy_reason(db, rf, batch["reel_id"], it["batch_id"],
+                                      rf["filename"])
+    if not reason:
+        reason = _content_dup_reason(db, rf, batch["reel_id"], rf["filename"])
+    if reason:
+        raise ValueError(reason + "（文件占用问题不能通过改绑绕过）")
 
     old_target = it["target_frame_id"]
     old_status, old_reason = it["status"], it["block_reason"]
