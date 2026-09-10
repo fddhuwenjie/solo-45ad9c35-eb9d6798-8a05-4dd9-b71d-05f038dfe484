@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微缩胶片扫描卷盘质检</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>🎞 微缩胶片扫描卷盘质检</h1>
+  <div class="reel-bar">
+    <select id="reelSelect"></select>
+    <button id="btnSample" class="primary">载入演示卷盘</button>
+    <button id="btnImport">导入 ZIP + 清单</button>
+    <button id="btnDeleteReel" class="danger ghost">删除当前卷</button>
+    <span class="spacer"></span>
+    <button id="btnUndo" disabled>↩ 撤销</button>
+    <button id="btnFinalize" class="primary">定稿检查</button>
+  </div>
+</header>
+
+<div id="importPanel" class="panel hidden">
+  <h3>导入卷盘（所有分析均在本机完成）</h3>
+  <div class="import-grid">
+    <label>帧图像 ZIP（TIFF/JPEG）<input type="file" id="zipFile" accept=".zip"></label>
+    <label>拍摄清单 CSV/JSON（可选）<input type="file" id="manifestFile" accept=".csv,.json"></label>
+    <label>卷盘名称<input type="text" id="reelName" placeholder="默认取 ZIP 文件名"></label>
+    <label>卷号<input type="text" id="reelNo" placeholder="如 R2026-001"></label>
+    <button id="btnDoImport" class="primary">开始导入</button>
+  </div>
+  <p class="hint">清单列：reel_no, frame_no, filename, note。清单中有而 ZIP 中缺失的帧将自动生成缺帧占位。</p>
+</div>
+
+<div id="empty" class="empty">
+  <p>还没有卷盘。点击 <b>载入演示卷盘</b> 查看内置样例（含缺帧、重复扫描、顺序倒置、方向异常、亮度突变等典型缺陷），或导入自己的 ZIP。</p>
+</div>
+
+<main id="main" class="hidden">
+  <section class="toolbar panel">
+    <label>缩放 <input type="range" id="zoom" min="60" max="320" value="140"></label>
+    <span id="reelInfo"></span>
+    <span class="spacer"></span>
+    <button id="btnExportJson">导出 JSON 清单</button>
+    <button id="btnExportCsv">导出 CSV 清单</button>
+    <button id="btnExportReshoot">导出重拍清单</button>
+    <button id="btnExportContact">导出卷盘总览图</button>
+  </section>
+
+  <section id="checksPanel" class="panel hidden">
+    <h3>定稿前检查</h3>
+    <ul id="checksList"></ul>
+  </section>
+
+  <section class="strip-wrap panel">
+    <div id="strip" class="strip"></div>
+  </section>
+
+  <div class="columns">
+    <section class="panel warn-panel">
+      <h3>告警 <span id="warnCount" class="badge"></span></h3>
+      <ul id="warnings"></ul>
+    </section>
+
+    <section class="panel detail-panel">
+      <h3>帧详情 / 操作</h3>
+      <div id="detail"><p class="hint">点击胶片带中的帧进行选择；Ctrl+点击可多选并排比较。</p></div>
+      <div id="compare" class="compare hidden"></div>
+    </section>
+  </div>
+</main>
+
+<input type="file" id="hiddenFile" class="hidden">
+<script src="/static/app.js"></script>
+</body>
+</html>
