@@ -53,8 +53,51 @@
   </section>
 
   <section class="strip-wrap panel">
+    <div class="strip-head">
+      <button id="btnBoundaryScan" class="ghost">🔍 边界复核：扫描候选</button>
+      <span id="boundarySummary" class="hint"></span>
+      <span class="spacer"></span>
+      <button id="btnMergeMode" class="ghost">合并选择模式：关</button>
+      <span id="mergePick" class="hint"></span>
+    </div>
     <div id="strip" class="strip"></div>
   </section>
+
+  <section id="boundaryPanel" class="panel boundary-panel hidden">
+    <div class="bd-head">
+      <h3>✂ 帧边界复核候选 <span id="bdCount" class="badge gray"></span></h3>
+      <span class="hint">依据列亮度谷、内容投影、相邻帧号与画幅比例提出；候选仅为建议，切线可在编辑器中拖动微调。</span>
+    </div>
+    <div class="bd-cols">
+      <div class="bd-col">
+        <h4>疑似两帧粘连（拆分）</h4>
+        <div id="bdSplits" class="bd-list"></div>
+      </div>
+      <div class="bd-col">
+        <h4>疑似画面中间误切（合并）</h4>
+        <div id="bdMerges" class="bd-list"></div>
+      </div>
+    </div>
+    <div class="bd-history-head">
+      <h4>修订记录（原图与来源区间已保留，可用顶部“撤销”恢复原边界与编号）</h4>
+      <span class="spacer"></span>
+      <button id="btnBdExportJson" class="ghost">导出边界变更 JSON</button>
+    </div>
+    <div id="bdHistory" class="bd-history"></div>
+  </section>
+
+  <div id="bdModal" class="bd-modal hidden">
+    <div class="bd-modal-box">
+      <div class="bd-modal-head">
+        <h3 id="bdModalTitle">帧边界编辑器</h3>
+        <span class="spacer"></span>
+        <button id="btnBdHelp" class="ghost">?</button>
+        <button id="btnBdClose" class="danger ghost">✕</button>
+      </div>
+      <div id="bdModalBody" class="bd-modal-body"></div>
+      <div id="bdModalFoot" class="bd-modal-foot"></div>
+    </div>
+  </div>
 
   <div class="columns">
     <section class="panel warn-panel">
@@ -114,5 +157,6 @@
 <input type="file" id="hiddenFile" class="hidden">
 <script src="/static/app.js"></script>
 <script src="/static/rescan.js"></script>
+<script src="/static/boundary.js"></script>
 </body>
 </html>

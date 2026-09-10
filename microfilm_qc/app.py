@@ -10,15 +10,17 @@ import zipfile
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
 from qc_core.db import DB
-from qc_core import analysis, imaging, rescan, sample_reel
+from qc_core import analysis, boundary, imaging, rescan, sample_reel
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
 FRAMES_DIR = os.path.join(DATA, "frames")
 RESCAN_DIR = os.path.join(DATA, "rescan")
+BOUNDARY_DIR = os.path.join(DATA, "boundary")
 EXPORT_DIR = os.path.join(DATA, "exports")
 os.makedirs(FRAMES_DIR, exist_ok=True)
 os.makedirs(RESCAN_DIR, exist_ok=True)
+os.makedirs(BOUNDARY_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 app = Flask(__name__)
@@ -149,14 +151,35 @@ def state(reel_id):
     n_versions = {r["frame_id"]: r["n"] for r in db.q(
         "SELECT frame_id, COUNT(*) n FROM frame_versions WHERE reel_id=? GROUP BY frame_id",
         (reel_id,))}
+    source_rows = db.q(
+        """SELECT fs.* FROM frame_sources fs
+           WHERE fs.id IN (SELECT MAX(id) FROM frame_sources WHERE reel_id=? GROUP BY frame_id)""",
+        (reel_id,))
+    src_map = {}
+    for s in source_rows:
+        region = {}
+        try:
+            region = json.loads(s["region"]) if s["region"] else {}
+        except ValueError:
+            pass
+        src_map[s["frame_id"]] = {
+            "kind": s["kind"], "op_id": s["op_id"],
+            "source_frame_id": s["source_frame_id"],
+            "source_filename": s["source_filename"],
+            "region_axis": region.get("axis"),
+            "region_index": region.get("index"),
+            "region_count": region.get("count"),
+            "region_layout": region.get("layout"),
+        }
     frames = []
     for f in db.frames(reel_id):
         d = {k: f[k] for k in ("id", "position", "frame_no", "filename", "note",
                                "brightness", "orient_score", "rotation",
-                               "excluded", "placeholder", "reshoot")}
+                               "excluded", "placeholder", "reshoot", "width", "height")}
         d["source"] = vsrc.get(f["id"], {}).get("source", "")
         d["version_kind"] = vsrc.get(f["id"], {}).get("kind", "")
         d["version_count"] = n_versions.get(f["id"], 0)
+        d["boundary"] = src_map.get(f["id"])
         frames.append(d)
     warnings = [dict(w) for w in db.q(
         "SELECT * FROM warnings WHERE reel_id=? ORDER BY resolved, id", (reel_id,))]
@@ -167,6 +190,7 @@ def state(reel_id):
         "warnings": warnings,
         "can_undo": len(db.revisions(reel_id)) > 0,
         "rescan_batches": rescan.list_batches(db, reel_id),
+        "boundary_ops": boundary.ops_list(db, reel_id),
         "checks": analysis.finalization_checks(db, reel_id),
     }
 
@@ -259,6 +283,8 @@ def delete_reel(reel_id):
     db.run("DELETE FROM warnings WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM revisions WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM frame_versions WHERE reel_id=?", (reel_id,))
+    db.run("DELETE FROM frame_sources WHERE reel_id=?", (reel_id,))
+    db.run("DELETE FROM boundary_ops WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM frames WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM rescan_batches WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM reels WHERE id=?", (reel_id,))
@@ -381,6 +407,157 @@ def delete_frame(frame_id):
     return mutate(f["reel_id"], "删除占位帧 No.%s" % f["frame_no"], op)
 
 
+# ---------------------------------------------------------------- 帧边界复核
+
+def _boundary_abort_revision(reel_id):
+    db.run("DELETE FROM revisions WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
+           (reel_id,))
+
+
+@app.route("/api/reels/<int:reel_id>/boundary/candidates")
+def boundary_candidates(reel_id):
+    reel_or_404(reel_id)
+    return jsonify(boundary.candidates(db, reel_id))
+
+
+@app.route("/api/frame/<int:frame_id>/boundary/preview")
+def boundary_split_preview(frame_id):
+    f = frame_or_404(frame_id)
+    if f["placeholder"]:
+        abort(400, "占位帧没有图像")
+    cuts = []
+    for item in request.args.getlist("cut"):
+        m = re.match(r"^([xy]):(-?\d+)$", item)
+        if not m:
+            abort(400, "切线格式应为 x:1234 或 y:567")
+        cuts.append({"axis": m.group(1), "pos": int(m.group(2))})
+    index = request.args.get("index", "")
+    index = int(index) if index.lstrip("-").isdigit() else None
+    w = max(200, min(2400, int(request.args.get("w", 1100))))
+    try:
+        data = boundary.split_preview(dict(f), cuts, index=index, out_w=w)
+    except ValueError as ex:
+        abort(400, str(ex))
+    return send_file(io.BytesIO(data), mimetype="image/jpeg")
+
+
+@app.route("/api/reels/<int:reel_id>/boundary/merge-preview")
+def boundary_merge_preview(reel_id):
+    reel_or_404(reel_id)
+    ids = request.args.get("ids", "")
+    try:
+        frame_ids = [int(x) for x in ids.split(",") if x]
+        frames = [dict(x) for x in db.frames(reel_id)]
+        data = boundary.merge_preview(frames, frame_ids,
+                                      out_w=max(200, min(2400, int(request.args.get("w", 1100)))))
+    except ValueError as ex:
+        abort(400, str(ex))
+    return send_file(io.BytesIO(data), mimetype="image/jpeg")
+
+
+@app.route("/api/frame/<int:frame_id>/boundary/split", methods=["POST"])
+def boundary_split(frame_id):
+    f = frame_or_404(frame_id)
+    reel_id = f["reel_id"]
+    body = request.get_json(force=True)
+    cuts = body.get("cuts") or []
+    norm = []
+    for c in cuts:
+        if (isinstance(c, dict) and c.get("axis") in ("x", "y")
+                and str(c.get("pos", "")).lstrip("-").isdigit()):
+            norm.append({"axis": c["axis"], "pos": int(c["pos"])})
+    if len(norm) != len(cuts):
+        abort(400, "切线格式无效（需要 {axis:'x'/'y', pos:像素}）")
+    reason = str(body.get("reason", "")).strip()
+    op_id = boundary.create_op(db, reel_id, "split", reason)
+    db.save_revision(reel_id, "帧边界拆分 No.%s（%d 段）" % (f["frame_no"], len(norm) + 1))
+    rev_id = db.one("SELECT MAX(id) id FROM revisions WHERE reel_id=?", (reel_id,))["id"]
+    try:
+        anchor, outputs, extra, op_id = boundary.split_frame(
+            db, DATA, reel_id, frame_id, norm, reason=reason, op_id=op_id)
+    except ValueError as ex:
+        boundary.discard_op(db, op_id)
+        _boundary_abort_revision(reel_id)
+        return jsonify({"error": str(ex), "state": state(reel_id)}), 400
+    db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
+    analysis.recheck(db, reel_id, outputs + _neighbors(db, reel_id, outputs))
+    db.run("UPDATE revisions SET extra=? WHERE id=?",
+           (json.dumps(extra, ensure_ascii=False), rev_id))
+    return jsonify({"op_id": op_id, "outputs": outputs, "state": state(reel_id)})
+
+
+@app.route("/api/reels/<int:reel_id>/boundary/merge", methods=["POST"])
+def boundary_merge(reel_id):
+    reel_or_404(reel_id)
+    body = request.get_json(force=True)
+    frame_ids = [int(x) for x in (body.get("frame_ids") or [])]
+    if not frame_ids:
+        abort(400, "请先选择要合并的连续帧")
+    layout = body.get("layout") or None
+    reason = str(body.get("reason", "")).strip()
+    frames = [dict(x) for x in db.frames(reel_id)]
+    try:
+        ordered = boundary._ordered_merge(frames, frame_ids)  # 先做连续性校验
+    except ValueError as ex:
+        return jsonify({"error": str(ex), "state": state(reel_id)}), 400
+    label = "、".join("No." + x["frame_no"] for x in ordered)
+    op_id = boundary.create_op(db, reel_id, "merge", reason)
+    db.save_revision(reel_id, "帧边界合并 %s" % label)
+    rev_id = db.one("SELECT MAX(id) id FROM revisions WHERE reel_id=?", (reel_id,))["id"]
+    try:
+        anchor, outputs, extra, op_id = boundary.merge_frames(
+            db, DATA, reel_id, frame_ids, layout=layout, reason=reason, op_id=op_id)
+    except ValueError as ex:
+        boundary.discard_op(db, op_id)
+        _boundary_abort_revision(reel_id)
+        return jsonify({"error": str(ex), "state": state(reel_id)}), 400
+    db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
+    analysis.recheck(db, reel_id, outputs + _neighbors(db, reel_id, outputs))
+    db.run("UPDATE revisions SET extra=? WHERE id=?",
+           (json.dumps(extra, ensure_ascii=False), rev_id))
+    return jsonify({"op_id": op_id, "outputs": outputs, "state": state(reel_id)})
+
+
+def _neighbors(db, reel_id, ids):
+    """局部重算窗口：参与帧在当前序列中的邻近帧。"""
+    frames = db.frames(reel_id)
+    id_set, out = set(ids), []
+    for i, f in enumerate(frames):
+        if f["id"] in id_set:
+            for k in range(max(0, i - analysis.RECHECK_RADIUS),
+                           min(len(frames), i + analysis.RECHECK_RADIUS + 1)):
+                out.append(frames[k]["id"])
+    return out
+
+
+@app.route("/api/reels/<int:reel_id>/boundary/ops")
+def boundary_ops(reel_id):
+    reel_or_404(reel_id)
+    return jsonify(boundary.ops_list(db, reel_id))
+
+
+@app.route("/api/reels/<int:reel_id>/boundary/export/changes.json")
+def boundary_export_changes(reel_id):
+    reel = reel_or_404(reel_id)
+    payload = boundary.changes_json(db, reel_id, reel["reel_no"], reel["name"])
+    buf = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+    return send_file(buf, mimetype="application/json", as_attachment=True,
+                     download_name="%s_boundary_changes.json" % reel["reel_no"])
+
+
+@app.route("/api/boundary-ops/<int:op_id>/comparison.png")
+def boundary_export_comparison(op_id):
+    op = db.one("SELECT * FROM boundary_ops WHERE id=?", (op_id,))
+    if not op:
+        abort(404, "边界修订不存在")
+    out = os.path.join(EXPORT_DIR, "boundary_compare_%d.png" % op_id)
+    data = boundary.comparison_png(db, op_id, path=out)
+    if data is None:
+        abort(404, "无法生成对照图（原图可能已清理）")
+    return send_file(out, mimetype="image/png", as_attachment=True,
+                     download_name="boundary_compare_op%d.png" % op_id)
+
+
 # ---------------------------------------------------------------- 告警 / 撤销 / 定稿
 
 @app.route("/api/warning/<int:warning_id>/resolve", methods=["POST"])
@@ -401,6 +578,7 @@ def undo(reel_id):
         return jsonify({"error": "没有可撤销的操作", "state": state(reel_id)}), 400
     if result.get("extra"):
         rollback_rescan(result["extra"])
+        boundary.rollback(db, result["extra"])
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     analysis.run_checks(db, reel_id)
     return jsonify({"undone": result["action"], "state": state(reel_id)})
@@ -592,6 +770,28 @@ def export_rows(reel_id):
         "SELECT frame_id, kind, source FROM frame_versions WHERE reel_id=? AND is_current=1",
         (reel_id,))
     vsrc = {v["frame_id"]: v for v in versions}
+    source_rows = db.q(
+        """SELECT fs.* FROM frame_sources fs
+           WHERE fs.id IN (SELECT MAX(id) FROM frame_sources WHERE reel_id=? GROUP BY frame_id)""",
+        (reel_id,))
+    smap = {}
+    for s in source_rows:
+        region = {}
+        try:
+            region = json.loads(s["region"]) if s["region"] else {}
+        except ValueError:
+            pass
+        if s["kind"] == "crop":
+            provenance = ("拆分自 %s（第 %d/%d 段，%s 向切线）"
+                          % (s["source_filename"], region.get("index", 0) + 1,
+                             region.get("count", 1),
+                             "竖" if region.get("axis") == "x" else "横"))
+        elif s["kind"] == "stitch":
+            provenance = "合并 %d 帧生成（%s）" % (
+                region.get("count", 2), "左右拼接" if region.get("layout") == "h" else "上下拼接")
+        else:
+            provenance = ""
+        smap[s["frame_id"]] = provenance
     rows = []
     for i, f in enumerate(frames):
         v = vsrc.get(f["id"])
@@ -605,8 +805,9 @@ def export_rows(reel_id):
                        "需重拍" if f["reshoot"] else "合格"),
             "reshoot": "是" if (f["reshoot"] or f["placeholder"]) else "",
             "current_source": ("补扫回填" if v and v["kind"] in ("fill", "reshoot")
+                               else "边界拆分/合并" if v and v["kind"] == "boundary"
                                else "原始扫描" if v else ""),
-            "provenance": v["source"] if v else "",
+            "provenance": smap.get(f["id"]) or (v["source"] if v else ""),
             "note": f["note"],
         })
     return rows

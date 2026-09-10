@@ -102,6 +102,51 @@ def apply_rotation(img, rotation):
     return img
 
 
+def effective_image(path, rotation=0):
+    """打开磁盘图像并按当前旋转角度转正，返回 RGB 图（调用方负责 close）。"""
+    img = Image.open(path)
+    img.load()
+    return apply_rotation(img.convert("RGB"), rotation)
+
+
+def crop_box(img, box):
+    """按 (x0,y0,x1,y1) 裁出子图（含端点修正）。"""
+    x0, y0, x1, y1 = box
+    return img.crop((max(0, x0), max(0, y0), min(img.width, x1), min(img.height, y1)))
+
+
+def stitch(images, layout):
+    """多图拼接：layout='v' 纵向叠放（统一宽），'h' 横向并排（统一高）。"""
+    images = [im for im in images if im is not None]
+    if not images:
+        raise ValueError("没有可拼接的图像")
+    if len(images) == 1:
+        return images[0].copy()
+    if layout == "v":
+        w = max(im.width for im in images)
+        norm = [(im if im.width == w else
+                 im.resize((w, max(1, round(im.height * w / im.width))), Image.LANCZOS))
+                for im in images]
+        h = sum(im.height for im in norm)
+        out = Image.new("RGB", (w, h), (12, 12, 14))
+        y = 0
+        for im in norm:
+            out.paste(im, (0, y))
+            y += im.height
+        return out
+    h = max(im.height for im in images)
+    norm = [(im if im.height == h else
+             im.resize((max(1, round(im.width * h / im.height)), h), Image.LANCZOS))
+            for im in images]
+    w = sum(im.width for im in norm)
+    out = Image.new("RGB", (w, h), (12, 12, 14))
+    x = 0
+    for im in norm:
+        out.paste(im, (x, 0))
+        x += im.width
+    return out
+
+
 def make_thumb(path, rotation, max_w):
     with Image.open(path) as img:
         img = apply_rotation(img.convert("RGB"), rotation)

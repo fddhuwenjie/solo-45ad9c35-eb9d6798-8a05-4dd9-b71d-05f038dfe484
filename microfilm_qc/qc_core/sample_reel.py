@@ -6,6 +6,7 @@
 import csv
 import io
 import random
+import re
 import zipfile
 from PIL import Image, ImageDraw, ImageFont
 
@@ -16,6 +17,9 @@ DUP_SRC, DUP_AT = 12, 13    # No.12 的内容被重复扫描到 No.13 的位置
 SWAP_A, SWAP_B = 25, 26     # 内容被扫反的一对
 ROTATED_NO = 30             # 旋转 90° 的帧
 DARK_NO = 33                # 曝光突变帧
+GLUE_NOS = (7, 8)           # 两帧被横向粘进同一文件（No.8 变为缺帧占位，待拆分填充）
+MISCUT_NO = 17             # No.17 在画面中间被误切成上下两半（同号衍生帧号 17/17b）
+SEAM_INK = 26              # 粘连接缝暗度
 
 
 def _font(size, bold=True):
@@ -82,6 +86,37 @@ def make_endmark(kind):
     return img
 
 
+def make_glued(a_img, b_img):
+    """两帧横向粘进同一文件（中间留深色压条接缝），模拟整卷扫描粘连。"""
+    gap = 46
+    h = max(a_img.height, b_img.height)
+
+    def norm(im):
+        if im.height != h:
+            im = im.resize((round(im.width * h / im.height), h))
+        return im
+
+    a_img, b_img = norm(a_img), norm(b_img)
+    w = a_img.width + gap + b_img.width
+    out = Image.new("L", (w, h), 235)
+    out.paste(a_img, (0, 0))
+    out.paste(b_img, (a_img.width + gap, 0))
+    d = ImageDraw.Draw(out)
+    d.rectangle([a_img.width, 0, a_img.width + gap - 1, h], fill=SEAM_INK)
+    # 接缝两侧的轻微暗角，强化“压条”观感
+    for k in range(10):
+        d.line([(a_img.width - 1 - k, 0), (a_img.width - 1 - k, h)], fill=150 + k)
+        d.line([(a_img.width + gap + k, 0), (a_img.width + gap + k, h)], fill=150 + k)
+    return out
+
+
+def make_miscut_halves(page_img):
+    """同一页在画面中间被误切成上下两半（留出白边），返回 (上半, 下半)。"""
+    w, h = page_img.size
+    cut = h // 2
+    return page_img.crop((0, 0, w, cut)), page_img.crop((0, cut, w, h))
+
+
 def build_sample():
     """返回 (zip_bytes, manifest_csv_bytes)。"""
     rng = random.Random(20260910)
@@ -91,12 +126,23 @@ def build_sample():
     # frame_no -> (filename, image, note)；顺序即胶片带顺序
     entries = [("0", "%s_0000_leader.tif" % REEL_NO, make_endmark("leader"), "leader")]
     for no in range(1, N_BODY + 1):
-        if no == MISSING_NO:
-            continue  # 缺帧：只进清单不进 ZIP
+        if no == MISSING_NO or no == GLUE_NOS[1]:
+            continue  # 缺帧 / 粘连图的第二帧：只进清单不进 ZIP
         content_no = {SWAP_A: SWAP_B, SWAP_B: SWAP_A}.get(no, no)  # 顺序倒置
         img = body[content_no]
         if no == DUP_AT:
             img = body[DUP_SRC]  # 重复扫描
+        if no == GLUE_NOS[0]:
+            img = make_glued(body[GLUE_NOS[0]], body[GLUE_NOS[1]])  # 两帧粘连
+            fname = "%s_%04d_glued.tif" % (REEL_NO, no)
+            entries.append((str(no), fname, img, "两帧粘连待拆分"))
+            continue
+        if no == MISCUT_NO:
+            # 误切两半：同号衍生帧号，顺序排在 16 与 18 之间
+            top, bot = make_miscut_halves(body[no])
+            entries.append((str(no), "%s_%04da.jpg" % (REEL_NO, no), top, "误切上半"))
+            entries.append(("%db" % no, "%s_%04db.jpg" % (REEL_NO, no), bot, "误切下半"))
+            continue
         ext = "jpg" if no % 3 == 0 else "tif"
         entries.append((str(no), "%s_%04d.%s" % (REEL_NO, no, ext), img, ""))
     entries.append((str(N_BODY + 1), "%s_%04d_trailer.tif" % (REEL_NO, N_BODY + 1),
@@ -116,8 +162,17 @@ def build_sample():
     w = csv.writer(cbuf)
     w.writerow(["reel_no", "frame_no", "filename", "note"])
     rows = [(fno, fname, note) for fno, fname, _, note in entries]
-    if str(MISSING_NO) not in {r[0] for r in rows}:  # 清单保留缺帧行（ZIP 中无此文件）
+    present_nos = {r[0] for r in rows}
+    if str(MISSING_NO) not in present_nos:  # 清单保留缺帧行（ZIP 中无此文件）
         rows.append((str(MISSING_NO), "%s_%04d.tif" % (REEL_NO, MISSING_NO), ""))
-    for fno, fname, note in sorted(rows, key=lambda r: int(r[0])):
+    if str(GLUE_NOS[1]) not in present_nos:  # 粘连第二帧：清单占位，拆分时可就地填充
+        rows.append((str(GLUE_NOS[1]), "%s_%04d.tif" % (REEL_NO, GLUE_NOS[1]),
+                     "粘连图内第二帧"))
+
+    def sort_key(r):
+        m = re.fullmatch(r"(\d+)([A-Za-z]?)", r[0])
+        return (int(m.group(1)), m.group(2)) if m else (10 ** 9, r[0])
+
+    for fno, fname, note in sorted(rows, key=sort_key):
         w.writerow([REEL_NO, fno, fname, note])
     return zbuf.getvalue(), cbuf.getvalue().encode("utf-8-sig")

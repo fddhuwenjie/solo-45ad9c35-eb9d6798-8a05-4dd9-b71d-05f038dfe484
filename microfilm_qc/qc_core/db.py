@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS frame_versions (
     source TEXT DEFAULT '',
     batch_id INTEGER,
     item_id INTEGER,
+    op_id INTEGER,
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_frames_reel ON frames(reel_id, position);
@@ -103,6 +104,32 @@ CREATE INDEX IF NOT EXISTS idx_rfiles_batch ON rescan_files(batch_id);
 CREATE INDEX IF NOT EXISTS idx_ritems_batch ON rescan_items(batch_id);
 CREATE INDEX IF NOT EXISTS idx_fver_frame ON frame_versions(frame_id, is_current);
 CREATE INDEX IF NOT EXISTS idx_fver_reel ON frame_versions(reel_id);
+
+-- 帧边界复核：每次“确认拆分/合并”为一个操作批次
+CREATE TABLE IF NOT EXISTS boundary_ops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reel_id INTEGER NOT NULL REFERENCES reels(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'split',   -- split / merge
+    reason TEXT DEFAULT '',
+    detail TEXT DEFAULT '',               -- JSON：输入帧、切线、输出帧、依据
+    created_at REAL NOT NULL
+);
+-- 输出来源关系：每张当前帧来自哪个原图（可链多代）、原图区间
+CREATE TABLE IF NOT EXISTS frame_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    frame_id INTEGER NOT NULL,
+    reel_id INTEGER NOT NULL REFERENCES reels(id) ON DELETE CASCADE,
+    source_frame_id INTEGER,
+    op_id INTEGER REFERENCES boundary_ops(id) ON DELETE SET NULL,
+    source_path TEXT DEFAULT '',          -- 原始扫描文件（永不删除）
+    source_filename TEXT DEFAULT '',
+    region TEXT DEFAULT '',               -- JSON: {x0,y0,x1,y1,w,h} 或拼接描述
+    kind TEXT NOT NULL DEFAULT 'crop',    -- crop / stitch / whole
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bops_reel ON boundary_ops(reel_id, id);
+CREATE INDEX IF NOT EXISTS idx_fsrc_frame ON frame_sources(frame_id);
+CREATE INDEX IF NOT EXISTS idx_fsrc_reel ON frame_sources(reel_id);
 """
 
 FRAME_COLS = ["id", "position", "frame_no", "filename", "stored_path", "note",
@@ -125,6 +152,9 @@ class DB:
         cols = {r["name"] for r in self.q("PRAGMA table_info(revisions)")}
         if "extra" not in cols:
             self.conn.execute("ALTER TABLE revisions ADD COLUMN extra TEXT DEFAULT ''")
+        fv_cols = {r["name"] for r in self.q("PRAGMA table_info(frame_versions)")}
+        if "op_id" not in fv_cols:
+            self.conn.execute("ALTER TABLE frame_versions ADD COLUMN op_id INTEGER")
 
     def q(self, sql, args=()):
         return self.conn.execute(sql, args).fetchall()
@@ -153,13 +183,13 @@ class DB:
 
     # ---- 帧版本（来源关系） ----
     def add_version(self, frame_id, reel_id, kind, filename, stored_path,
-                    source="", batch_id=None, item_id=None, is_current=1):
+                    source="", batch_id=None, item_id=None, is_current=1, op_id=None):
         cur = self.run(
             """INSERT INTO frame_versions(frame_id, reel_id, kind, filename, stored_path,
-                                          is_current, source, batch_id, item_id, created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                                          is_current, source, batch_id, item_id, op_id, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (frame_id, reel_id, kind, filename, stored_path, is_current, source,
-             batch_id, item_id, time.time()))
+             batch_id, item_id, op_id, time.time()))
         return cur.lastrowid
 
     def current_version(self, frame_id):
@@ -211,3 +241,32 @@ class DB:
     def revisions(self, reel_id):
         return self.q("SELECT id, action, created_at FROM revisions WHERE reel_id=? ORDER BY id DESC",
                       (reel_id,))
+
+    # ---- 帧边界复核 ----
+    def add_boundary_op(self, reel_id, kind, reason, detail):
+        cur = self.run(
+            "INSERT INTO boundary_ops(reel_id, kind, reason, detail, created_at) VALUES(?,?,?,?,?)",
+            (reel_id, kind, reason, json.dumps(detail, ensure_ascii=False), time.time()))
+        return cur.lastrowid
+
+    def boundary_ops(self, reel_id):
+        return self.q("SELECT * FROM boundary_ops WHERE reel_id=? ORDER BY id", (reel_id,))
+
+    def add_frame_source(self, frame_id, reel_id, kind, source_frame_id=None, op_id=None,
+                         source_path="", source_filename="", region=None):
+        cur = self.run(
+            """INSERT INTO frame_sources(frame_id, reel_id, source_frame_id, op_id, source_path,
+                                         source_filename, region, kind, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (frame_id, reel_id, source_frame_id, op_id, source_path, source_filename,
+             json.dumps(region, ensure_ascii=False) if region else "", kind, time.time()))
+        return cur.lastrowid
+
+    def frame_sources(self, frame_id):
+        return self.q("SELECT * FROM frame_sources WHERE frame_id=? ORDER BY id", (frame_id,))
+
+    def source_map(self, reel_id):
+        return self.q(
+            """SELECT fs.* FROM frame_sources fs
+               WHERE fs.id IN (SELECT MAX(id) FROM frame_sources WHERE reel_id=? GROUP BY frame_id)""",
+            (reel_id,))
