@@ -1,0 +1,13 @@
+# 微缩胶片质检工作台 —— 运行期依赖（全量锁定，保证可复现安装）
+# Python: 3.10 – 3.12（须与解释器 ABI 匹配：Pillow 含 C 扩展，
+#               切勿把为其它小版本编译的 .so / site-packages 直接复制到本版本）
+Flask==3.1.3
+Pillow==12.3.0
+
+# Flask 的传递依赖（显式锁定，避免不同解析结果引入未验证版本）
+Werkzeug==3.1.8
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+itsdangerous==2.2.0
+click==8.5.0
+blinker==1.9.0

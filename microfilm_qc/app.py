@@ -1,4 +1,30 @@
 """微缩胶片扫描卷盘质检工具 —— Flask 主应用。所有分析均在本机完成。"""
+import sys
+
+# 启动期依赖自检必须最先执行：qc_core 在模块导入阶段就会加载 PIL，
+# 若 Pillow 的 C 扩展与当前解释器 ABI 不匹配（例如把 CPython 3.11 的
+# site-packages 复制到 3.12），导入会直接失败；这里转成可操作的提示。
+def _require_runtime():
+    import platform
+    try:
+        import flask  # noqa: F401
+        from PIL import Image
+        with Image.new("RGB", (2, 2)) as probe:
+            probe.convert("L")
+    except ImportError as ex:
+        raise SystemExit(
+            "缺少运行依赖或 Pillow 二进制扩展不兼容：%s\n"
+            "当前解释器：Python %s（%s）。\n"
+            "Flask/Pillow 必须在该解释器环境内安装（Pillow 的 _imaging 为 C 扩展，\n"
+            "不能跨 Python 小版本复制 site-packages）。请执行：\n"
+            "    python -m pip install -r requirements.txt\n"
+            "如已安装仍报错，强制重装匹配 wheel：\n"
+            "    python -m pip install --force-reinstall --no-cache-dir -r requirements.txt"
+            % (ex, platform.python_version(), platform.machine()))
+
+
+_require_runtime()
+
 import csv
 import io
 import json
@@ -1172,4 +1198,7 @@ def export_contact(reel_id):
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    # _require_runtime() 已在模块导入最前面执行（qc_core 会立即导入 PIL）
+    host = os.environ.get("MICROFILM_QC_HOST", "127.0.0.1")
+    port = int(os.environ.get("MICROFILM_QC_PORT", "5000"))
+    app.run(host=host, port=port, debug=False)

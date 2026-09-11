@@ -1,0 +1,18 @@
+# 数据与数据库（运行期产物，不进镜像；应通过卷挂载持久化）
+data/
+
+# 随附的旧环境 site-packages（CPython 3.11 专用 C 扩展，ABI 绑定具体解释器）
+.pyuser/
+
+# Python 缓存与虚拟环境
+__pycache__/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# 测试与杂项（镜像只保留运行所需）
+tests/
+.git/
+.gitignore
