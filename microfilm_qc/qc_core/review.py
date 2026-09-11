@@ -593,6 +593,85 @@ def invalidate_rounds_for_frames(db, reel_id, frame_ids, reason):
     return ids
 
 
+def _active_item_for_frame(db, round_id, frame_id):
+    """该轮中该帧“当前生效”的抽中项：优先最新的非 void 项，否则最新一项（可能已 void）。"""
+    row = db.one(
+        """SELECT * FROM review_items
+           WHERE round_id=? AND frame_id=? AND status!=?
+           ORDER BY id DESC LIMIT 1""",
+        (round_id, frame_id, IT_VOID))
+    if row:
+        return row
+    return db.one(
+        "SELECT * FROM review_items WHERE round_id=? AND frame_id=? ORDER BY id DESC LIMIT 1",
+        (round_id, frame_id))
+
+
+def supersede_rotation(db, reel_id, frame_id, new_rotation, reason):
+    """抽样后调整朝向：旧记录保持 void（含历史与缘由），并在同一轮插入一条按新朝向
+    锁定的、可重新判定的新记录。新记录未判定前该轮无法通过/定稿。
+
+    仅影响开放中的轮次；已结束轮次不动。返回写入修订 extra 的操作列表：
+    [{"op": "supersede", "old_item_id":..., "new_item_id":...}]。
+    """
+    f = db.one("SELECT * FROM frames WHERE id=?", (frame_id,))
+    if not f:
+        return []
+    ver = db.one("SELECT * FROM frame_versions WHERE frame_id=? AND is_current=1", (frame_id,))
+    locked_path = ver["stored_path"] if ver and ver["stored_path"] else f["stored_path"]
+    try:
+        locked_md5 = _md5_file(locked_path) if locked_path and os.path.exists(locked_path) else ""
+    except OSError:
+        locked_md5 = ""
+
+    ops = []
+    rounds = db.q("SELECT id FROM review_rounds WHERE reel_id=? AND status='open'", (reel_id,))
+    now = time.time()
+    for rr in rounds:
+        old = _active_item_for_frame(db, rr["id"], frame_id)
+        if not old:
+            continue  # 该帧本就未被此轮抽中
+        # 幂等：已经是同一朝向下的待判替代项，则无需再建
+        if (old["status"] != IT_VOID and int(old["locked_rotation"] or 0) == int(new_rotation)):
+            continue
+        max_idx = db.one("SELECT MAX(anon_index) m FROM review_items WHERE round_id=?",
+                         (rr["id"],))["m"] or 0
+        cur = db.run(
+            """INSERT INTO review_items(round_id, reel_id, frame_id, anon_index, segment,
+                                        selected_by, forced_tags, locked_version_id,
+                                        locked_filename, locked_path, locked_rotation,
+                                        locked_md5, status, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (rr["id"], reel_id, frame_id, max_idx + 1,
+             old["segment"], old["selected_by"], old["forced_tags"],
+             ver["id"] if ver else old["locked_version_id"],
+             ver["filename"] if ver else old["locked_filename"],
+             locked_path, int(new_rotation), locked_md5, IT_PENDING, now))
+        new_id = cur.lastrowid
+        # 旧记录永久 void（若此前尚未 void），并链接到替代项；历史不动
+        db.run("UPDATE review_items SET status=?, void_reason=?, superseded_by=? WHERE id=?",
+               (IT_VOID, reason[:MAX_REMARKS], new_id, old["id"]))
+        ops.append({"op": "supersede", "old_item_id": old["id"], "new_item_id": new_id})
+    return ops
+
+
+def undo_supersede(db, ops):
+    """撤销朝向调整修订：删除替代项（含其审阅历史），恢复旧项到作废前判定。
+
+    修订撤销后帧朝向已回到锁定值，旧项因此恢复有效，新项被删除，等同旋转未发生。
+    """
+    for op in ops or []:
+        if op.get("op") != "supersede":
+            continue
+        new_id, old_id = op.get("new_item_id"), op.get("old_item_id")
+        if new_id:
+            db.run("DELETE FROM review_judgements WHERE item_id=?", (new_id,))
+            db.run("DELETE FROM review_items WHERE id=?", (new_id,))
+        if old_id:
+            db.run("UPDATE review_items SET superseded_by=NULL WHERE id=?", (old_id,))
+            _reinstate_item(db, old_id)
+
+
 def _reinstate_item(db, item_id):
     """撤销换图/朝向修订时恢复作废项（仅当锁定版本与朝向都恢复成抽样时状态）。"""
     it = db.one("SELECT * FROM review_items WHERE id=?", (item_id,))
@@ -701,7 +780,9 @@ def round_detail(db, round_id, include_audit=False):
                       "forced_labels": [TAG_LABEL.get(t, t) for t in tags],
                       "locked_version_id": it["locked_version_id"],
                       "locked_filename": it["locked_filename"],
-                      "locked_md5": it["locked_md5"]})
+                      "locked_rotation": it["locked_rotation"],
+                      "locked_md5": it["locked_md5"],
+                      "superseded_by": it["superseded_by"]})
         out_items.append(d)
     p = round_progress(db, round_id)
     passable, _ = can_pass(db, round_id)
@@ -786,7 +867,9 @@ def _round_payload(db, rnd):
             "void_reason": it["void_reason"],
             "locked_version_id": it.get("locked_version_id"),
             "locked_filename": it.get("locked_filename"),
+            "locked_rotation": it.get("locked_rotation"),
             "locked_md5": it.get("locked_md5"),
+            "superseded_by": it.get("superseded_by"),
         })
     return {
         "round_id": rnd["id"], "chain_id": rnd["chain_id"], "seq": rnd["seq"],
@@ -835,8 +918,9 @@ def handoff_csv(db, reel):
     w.writerow(["reel_no", "round_id", "chain_id", "轮次序号", "复核人", "种子",
                 "抽样方式", "抽取数量", "抽取占比", "失败门限",
                 "匿名序号", "帧号", "文件名", "落区", "入选方式", "强制纳入原因",
-                "锁定版本id", "锁定文件", "判定", "清晰度", "裁边", "朝向", "污损",
-                "内容缺失", "不合格备注", "转入重拍", "作废缘由", "最终处置"])
+                "锁定版本id", "锁定文件", "锁定朝向", "判定", "清晰度", "裁边", "朝向",
+                "污损", "内容缺失", "不合格备注", "转入重拍", "作废缘由",
+                "重判替代旧项id", "最终处置"])
     mode_label = "数量" if rnd["mode"] == "count" else "占比"
 
     def verdict_label(it):
@@ -845,7 +929,9 @@ def handoff_csv(db, reel):
 
     def disposition(it):
         if it["status"] == "void":
-            return "作废不计入（" + (it["void_reason"] or "") + "）"
+            return "作废不计入，已由重判项 #%s 替代（%s）" % (
+                it["superseded_by"], it["void_reason"]) if it.get("superseded_by") \
+                else "作废不计入（" + (it["void_reason"] or "") + "）"
         if it["transfer_reshoot"]:
             return "不合格，已转入重拍"
         if it["status"] == "fail":
@@ -864,10 +950,12 @@ def handoff_csv(db, reel):
             {"random": "随机", "forced": "强制", "both": "随机+强制"}.get(
                 it["selected_by"], it["selected_by"]),
             "、".join(it["forced_labels"]),
-            it["locked_version_id"], it["locked_filename"], verdict_label(it),
+            it["locked_version_id"], it["locked_filename"],
+            it.get("locked_rotation", ""), verdict_label(it),
             it["dims"]["clarity"], it["dims"]["crop"], it["dims"]["orientation"],
             it["dims"]["blemish"], it["dims"]["missing"],
             it["note"], "是" if it["transfer_reshoot"] else "",
-            it["void_reason"], disposition(it),
+            it["void_reason"], it.get("superseded_by") or "",
+            disposition(it),
         ])
     return buf.getvalue().encode("utf-8-sig")

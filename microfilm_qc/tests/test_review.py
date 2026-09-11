@@ -467,6 +467,74 @@ class ReviewFinalizeTests(ReviewTestBase):
         _rid, d = self.start_round(count=3, seed="LIM")
         self.assertEqual(d["round"]["fail_limit"], 2)
 
+    def test_rotated_sample_requires_reacceptance_e2e(self):
+        """端到端复现并修复：抽样后旋转朝向，旧记录 void 但同轮产生可重判新项；
+        重判完成前通过/定稿/移交全部被拦截，重判后才放行；旧判定与 void 缘由保留。"""
+        self.resolve_all_warnings()
+        _rid, d = self.start_round(count=36, seed="E2E", reviewer="甲")
+        r1 = d["round"]["id"]
+        audit = self.c.get("/api/reviews/%d/audit" % r1).get_json()
+        it33 = next(i for i in audit["items"] if i["frame_no"] == "33")
+        self.judge(it33["id"], "甲", "pass")
+        f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
+                         (self.rid,))
+        # 抽样后旋转朝向
+        self.assertEqual(
+            self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90}).status_code,
+            200)
+        old = app.db.one("SELECT * FROM review_items WHERE id=?", (it33["id"],))
+        self.assertEqual(old["status"], "void")
+        new_id = old["superseded_by"]
+        self.assertIsNotNone(new_id)
+        # 另开轮次/加抽均被拒（已有复核中轮次）
+        self.assertEqual(
+            self.c.post("/api/reels/%d/reviews/start" % self.rid,
+                        json={"reviewer": "甲", "mode": "count", "count": 3,
+                              "seed": "X"}).status_code, 400)
+        # 判完除新项外的所有待判项
+        cur = self.c.get("/api/reviews/%d" % r1).get_json()
+        for it in cur["items"]:
+            if it["status"] == "pending" and it["id"] != new_id:
+                self.judge(it["id"], "甲", "pass")
+        # 新朝向项未判 -> 通过、定稿、移交全部 400
+        self.assertEqual(
+            self.c.post("/api/reviews/%d/finish" % r1,
+                        json={"reviewer": "甲", "action": "pass"}).status_code, 400)
+        self.assertEqual(
+            self.c.post("/api/reels/%d/finalize" % self.rid).status_code, 400)
+        self.assertEqual(
+            self.c.get("/api/reels/%d/reviews/handoff.json" % self.rid).status_code, 400)
+        # 旧记录仍是 void，旧判定历史保留
+        self.assertEqual(
+            app.db.one("SELECT status FROM review_items WHERE id=?",
+                       (it33["id"],))["status"], "void")
+        self.assertEqual(
+            app.db.one("SELECT COUNT(*) c FROM review_judgements WHERE item_id=?",
+                       (it33["id"],))["c"], 1)
+        # 对新朝向项完成五项判定
+        self.judge(new_id, "甲", "pass")
+        # 旋转可能重算出方向告警；与验收无关，确认后再定稿
+        for w in self.c.get("/api/reels/%d/state" % self.rid).get_json()["warnings"]:
+            if not w["resolved"]:
+                self.c.post("/api/warning/%d/resolve" % w["id"], json={"value": True})
+        # 现在可通过、定稿、移交
+        r = self.c.post("/api/reviews/%d/finish" % r1,
+                        json={"reviewer": "甲", "action": "pass"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(
+            self.c.post("/api/reels/%d/finalize" % self.rid).status_code, 200)
+        hj = self.c.get("/api/reels/%d/reviews/handoff.json" % self.rid).get_json()
+        handoff_items = hj["final_review"]["items"]
+        # 移交同时含 void 旧记录（带 superseded_by）与合格新记录
+        old_row = next(i for i in handoff_items if i["anon_index"] == it33["anon_index"])
+        self.assertEqual(old_row["status"], "void")
+        self.assertEqual(old_row["superseded_by"], new_id)
+        new_audit = next(i for i in
+                         self.c.get("/api/reviews/%d/audit" % r1).get_json()["items"]
+                         if i["id"] == new_id)
+        self.assertEqual(new_audit["status"], "pass")
+        self.assertEqual(new_audit["locked_rotation"], 90)
+
 
 # ---------------------------------------------------------------- 回归：五项明确判定
 
@@ -632,59 +700,107 @@ class RotationLockTests(ReviewTestBase):
     def _item_for(self, frame_no):
         return next(i for i in self.audit["items"] if i["frame_no"] == str(frame_no))
 
-    def test_rotate_after_sample_voids_item(self):
+    def test_rotate_after_sample_voids_old_and_creates_rejudge_item(self):
         it = self._item_for(33)
         self.judge(it["id"], "甲", "pass")
         f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
                          (self.rid,))
         r = self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90})
         self.assertEqual(r.status_code, 200)
-        row = app.db.one("SELECT * FROM review_items WHERE id=?", (it["id"],))
-        self.assertEqual(row["status"], "void")
-        self.assertIn("调整朝向", row["void_reason"])
-        # 审阅历史保留
+        # 旧记录保持 void、写有缘由、保留历史，并链接到替代项
+        old = app.db.one("SELECT * FROM review_items WHERE id=?", (it["id"],))
+        self.assertEqual(old["status"], "void")
+        self.assertIn("调整朝向", old["void_reason"])
+        self.assertIsNotNone(old["superseded_by"])
         n = app.db.one("SELECT COUNT(*) c FROM review_judgements WHERE item_id=?",
                        (it["id"],))["c"]
         self.assertEqual(n, 1)
-        # 作废项不能继续判
+        # 旧（void）项不能再判
         r = self.judge(it["id"], "甲", "pass", expect=400)
         self.assertIn("作废", r.get_json()["error"])
+        # 同一轮出现一条按新朝向锁定的待判替代项
+        new = app.db.one("SELECT * FROM review_items WHERE id=?",
+                         (old["superseded_by"],))
+        self.assertEqual(new["status"], "pending")
+        self.assertEqual(new["locked_rotation"], 90)
+        self.assertEqual(new["frame_id"], f33["id"])
+        self.assertEqual(new["round_id"], self.r1)
 
-    def test_voided_by_rotation_excluded_from_drift_round_can_finish(self):
-        # 旋转一张后作废，其余全部合格：轮次可以正常给出结论而不是被漂移卡死
+    def test_rotated_image_must_be_rejudged_before_round_passes(self):
+        # 旋转后旧项 void、新项 pending；其余判完也不能通过，必须重新判定新朝向项
         it_void = self._item_for(33)
         self.judge(it_void["id"], "甲", "pass")
         f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
                          (self.rid,))
         self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90})
+        old = app.db.one("SELECT * FROM review_items WHERE id=?", (it_void["id"],))
+        new_id = old["superseded_by"]
         cur = self.c.get("/api/reviews/%d" % self.r1).get_json()
         for it in cur["items"]:
-            if it["status"] == "pending":
+            if it["status"] == "pending" and it["id"] != new_id:
                 self.judge(it["id"], "甲", "pass")
-        # 无失败项（作废项不计），门限 0 下可以通过
+        # 新朝向项未判：本轮不能通过
+        r = self.c.post("/api/reviews/%d/finish" % self.r1,
+                        json={"reviewer": "甲", "action": "pass"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("未判定", r.get_json()["error"])
+        # 定稿同样被门禁拦截（无有效通过结论）
+        rf = self.c.post("/api/reels/%d/finalize" % self.rid)
+        self.assertEqual(rf.status_code, 400)
+        # 完成新朝向项的五项判定后才能通过
+        self.judge(new_id, "甲", "pass")
         r = self.c.post("/api/reviews/%d/finish" % self.r1,
                         json={"reviewer": "甲", "action": "pass"})
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         self.assertEqual(r.get_json()["status"], "passed")
 
-    def test_undo_rotation_reinstates_when_rotation_restored(self):
+    def test_rotated_rejudge_item_anonymous_view(self):
+        # 新的可判项出现在匿名审片列表，且不暴露帧号/文件；旧 void 项仍在
         it = self._item_for(33)
         self.judge(it["id"], "甲", "pass")
         f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
                          (self.rid,))
         self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90})
-        self.assertEqual(
-            app.db.one("SELECT status FROM review_items WHERE id=?",
-                       (it["id"],))["status"], "void")
-        # 撤销旋转：锁定朝向恢复 -> 作废项恢复到作废前判定
+        old = app.db.one("SELECT superseded_by FROM review_items WHERE id=?",
+                         (it["id"],))
+        anon = self.c.get("/api/reviews/%d" % self.r1).get_json()
+        new_item = next(i for i in anon["items"] if i["id"] == old["superseded_by"])
+        self.assertEqual(new_item["status"], "pending")
+        self.assertNotIn("frame_no", new_item)
+        self.assertNotIn("filename", new_item)
+        self.assertNotIn("superseded_by", new_item)
+        # 新项匿名图按新朝向返回
+        img = self.c.get("/api/review-items/%d/image" % new_item["id"])
+        self.assertEqual(img.status_code, 200)
+
+    def test_undo_rotation_reinstates_old_and_deletes_rejudge_item(self):
+        it = self._item_for(33)
+        self.judge(it["id"], "甲", "pass")
+        f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
+                         (self.rid,))
+        self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90})
+        old = app.db.one("SELECT * FROM review_items WHERE id=?", (it["id"],))
+        self.assertEqual(old["status"], "void")
+        new_id = old["superseded_by"]
+        # 撤销旋转：帧朝向回到锁定值 -> 旧项恢复作废前判定，替代项（含其历史）删除
         r = self.c.post("/api/reels/%d/undo" % self.rid)
         self.assertEqual(r.status_code, 200)
+        restored = app.db.one("SELECT * FROM review_items WHERE id=?", (it["id"],))
+        self.assertEqual(restored["status"], "pass")
+        self.assertIsNone(restored["superseded_by"])
         self.assertEqual(
-            app.db.one("SELECT status FROM review_items WHERE id=?",
-                       (it["id"],))["status"], "pass")
+            app.db.one("SELECT COUNT(*) c FROM review_items WHERE id=?",
+                       (new_id,))["c"], 0)
+        self.assertEqual(
+            app.db.one("SELECT COUNT(*) c FROM review_judgements WHERE item_id=?",
+                       (new_id,))["c"], 0)
+        # 原判定历史仍在
+        self.assertEqual(
+            app.db.one("SELECT COUNT(*) c FROM review_judgements WHERE item_id=?",
+                       (it["id"],))["c"], 1)
 
     def test_rotate_unsampled_frame_does_not_void(self):
-        # 36/37 中唯一未被抽中的帧旋转不应产生作废记录
+        # 36/37 中唯一未被抽中的帧旋转不应产生作废/替代记录
         sampled_fids = {i["frame_id"] for i in self.audit["items"]}
         unsampled = next(f for f in self.state()["frames"]
                          if not f["placeholder"] and f["id"] not in sampled_fids)

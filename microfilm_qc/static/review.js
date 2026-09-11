@@ -302,6 +302,7 @@ function rvRenderAudit(d) {
       { random: "随机", forced: "强制", both: "随机+强制" }[it.selected_by] || it.selected_by}` +
     (tags ? ` ｜ 强制原因：${tags}` : "") +
     (it.status === "void" ? `<br><span class="rv-fail">已作废：${it.void_reason}</span>` : "") +
+    (it.superseded_by ? `<br><span class="rv-warn">已由重判项 #${it.superseded_by} 按新朝向替代（本记录留作证据）</span>` : "") +
     (it.note ? `<br>备注：${it.note}` : "");
   const dims = it.dims || {};
   document.querySelectorAll("#rvDims .rv-dim-row").forEach((row) => {

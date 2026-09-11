@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS review_items (
     note TEXT DEFAULT '',                    -- 不合格备注（fail 必填）
     transfer_reshoot INTEGER NOT NULL DEFAULT 0,  -- 判定同时转入重拍
     void_reason TEXT DEFAULT '',
+    superseded_by INTEGER,                  -- 换图/朝向调整后重判：指向替代它的新 review_items.id（旧记录保持 void）
     decided_at REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
 );
@@ -238,6 +239,10 @@ class DB:
             self.conn.execute("ALTER TABLE rescan_items ADD COLUMN reg_manual INTEGER NOT NULL DEFAULT 0")
         if "force_reason" not in ri_cols:
             self.conn.execute("ALTER TABLE rescan_items ADD COLUMN force_reason TEXT DEFAULT ''")
+        rvi_cols = {r["name"] for r in self.q("PRAGMA table_info(review_items)")}
+        if "superseded_by" not in rvi_cols:
+            self.conn.execute(
+                "ALTER TABLE review_items ADD COLUMN superseded_by INTEGER")
 
     def q(self, sql, args=()):
         return self.conn.execute(sql, args).fetchall()

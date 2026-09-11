@@ -377,17 +377,14 @@ def rotate(frame_id):
                    (fp["phash"], fp["brightness"], fp["orient_score"], frame_id))
 
     def post():
-        # 二次验收：抽样锁定了图像版本的旋转角度；朝向调整即改变受检图像，
-        # 必须把开放轮次中该帧的抽中记录置为 void（历史保留），否则轮次会被
-        # “锁定后朝向被调整”的版本漂移永久卡住、无法通过或重判。
-        extra = {}
-        void_ids = review.invalidate_frame(
-            db, f["reel_id"], frame_id,
-            "抽样锁定后人工调整朝向 %d°（No.%s：%d°→%d°）"
+        # 二次验收：抽样锁定了图像版本的旋转角度。朝向调整后，旧记录永久置 void
+        # （历史与作废缘由保留），并在同一轮插入按新朝向锁定的可重新判定项；
+        # 新项未判定前本轮不能通过/定稿，确保调整后的图像仍经过二次验收。
+        ops = review.supersede_rotation(
+            db, f["reel_id"], frame_id, newrot,
+            "抽样锁定后人工调整朝向 %d°（No.%s：%d°→%d°），按新朝向重新复核"
             % (deg, f["frame_no"], f["rotation"], newrot))
-        if void_ids:
-            extra["review"] = [{"op": "void", "item_id": iid} for iid in void_ids]
-        return extra
+        return {"review": ops} if ops else {}
 
     return mutate(f["reel_id"], "旋转帧 No.%s %d°" % (f["frame_no"], deg), op, post=post)
 
@@ -655,9 +652,11 @@ def undo(reel_id):
     if result.get("extra"):
         rollback_rescan(result["extra"])
         boundary.rollback(db, result["extra"])
+        review_ops = result["extra"].get("review", [])
         review.undo_invalidate(
-            db, [op.get("item_id") for op in result["extra"].get("review", [])
-                 if op.get("op") == "void"])
+            db, [op.get("item_id") for op in review_ops if op.get("op") == "void"])
+        review.undo_supersede(
+            db, [op for op in review_ops if op.get("op") == "supersede"])
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     analysis.run_checks(db, reel_id)
     return jsonify({"undone": result["action"], "state": state(reel_id)})
