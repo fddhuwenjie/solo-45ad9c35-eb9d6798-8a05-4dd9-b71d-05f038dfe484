@@ -110,7 +110,6 @@ async function rvOpen(roundId) {
     rv.detail = await api(`/api/reviews/${roundId}`);
   } catch (e) { return; }
   rv.mode = "anon";
-  rv.mode = "anon";
   rv.pos = rv.detail.items.findIndex((it) => it.status === "pending");
   if (rv.pos < 0) rv.pos = 0;
   $("#rvModal").classList.remove("hidden");
@@ -146,20 +145,31 @@ function rvRenderViewer() {
   $("#rvVoidNote").classList.toggle("hidden", !isVoid);
   $("#rvVoidNote").textContent = isVoid
     ? `本记录已作废，不计入本轮结论：${it.void_reason || "复核期间图像被更换"}。审阅历史保留。` : "";
-  // 载入已有判定（允许改判，历史保留）
+  // 载入已有判定（允许改判，历史保留）；未判定时五项必须逐项明确选择
   const dims = it.dims || {};
-  document.querySelectorAll("#rvDims input[type=checkbox]").forEach((cb) => {
-    cb.checked = !!dims[cb.dataset.dim];
-    cb.disabled = isVoid;
+  const locked = isVoid || rv.mode === "audit";
+  document.querySelectorAll("#rvDims .rv-dim-row").forEach((row) => {
+    const key = row.dataset.dim;
+    const radios = row.querySelectorAll("input[type=radio]");
+    radios.forEach((rb) => { rb.checked = false; rb.disabled = locked; });
+    if (dims[key] !== undefined && dims[key] !== null) {
+      const want = dims[key] ? "1" : "0";
+      const sel = row.querySelector(`input[value="${want}"]`);
+      if (sel) sel.checked = true;
+    }
+    row.classList.toggle("rv-unset",
+      !locked && (dims[key] === undefined || dims[key] === null));
   });
   $("#rvNote").value = it.note || "";
-  $("#rvNote").disabled = isVoid;
+  $("#rvNote").disabled = locked;
   $("#rvReshoot").checked = !!it.transfer_reshoot;
-  $("#rvReshoot").disabled = isVoid;
-  $("#btnRvPass").disabled = isVoid;
-  $("#btnRvFail").disabled = isVoid;
+  $("#rvReshoot").disabled = locked;
+  const interactive = !locked;
+  $("#btnRvPass").disabled = !interactive;
+  $("#btnRvFail").disabled = !interactive;
   $("#btnRvPrev").disabled = rv.pos === 0;
   $("#btnRvNext").disabled = rv.pos === items.length - 1;
+  if (rv.mode === "anon") rvSyncJudgeButtons();
 
   // 全部判定后展示结论区
   const doneBox = $("#rvDone");
@@ -177,14 +187,37 @@ function rvRenderViewer() {
   }
 }
 
+/* 读取五项判定：返回 {dims, unset:[], bad:[]}；
+   未选择的项计入 unset（区别于明确的“不合格”）。 */
+function rvReadDims() {
+  const dims = {}, unset = [];
+  document.querySelectorAll("#rvDims .rv-dim-row").forEach((row) => {
+    const key = row.dataset.dim;
+    const sel = row.querySelector("input[type=radio]:checked");
+    if (!sel) { unset.push(key); dims[key] = null; }
+    else dims[key] = sel.value === "1";
+  });
+  const bad = RV_DIMS.filter(([k]) => dims[k] === false).map(([k]) => k);
+  return { dims, unset, bad };
+}
+
+/* 五项明确且全部合格才可直接判合格；存在明确不合格项才可判不合格 */
+function rvSyncJudgeButtons() {
+  const { dims, unset, bad } = rvReadDims();
+  const decidedAll = unset.length === 0;
+  $("#btnRvPass").disabled = !decidedAll || bad.length > 0;
+  $("#btnRvFail").disabled = !decidedAll || bad.length === 0;
+}
+
 async function rvJudge(verdict) {
   if (rv.busy) return;
   const d = rv.detail;
   const it = rvEffectiveItems()[rv.pos];
-  const dims = {};
-  document.querySelectorAll("#rvDims input[type=checkbox]").forEach((cb) => {
-    dims[cb.dataset.dim] = cb.checked;
-  });
+  const { dims, unset } = rvReadDims();
+  if (unset.length) {
+    const names = RV_DIMS.filter(([k]) => unset.includes(k)).map(([, n]) => n).join("、");
+    return toast(`请对 ${names} 明确选择合格/不合格`, true);
+  }
   const note = $("#rvNote").value;
   if (verdict === "fail" && !note.trim()) {
     return toast("不合格项必须填写备注", true);
@@ -270,8 +303,15 @@ function rvRenderAudit(d) {
     (tags ? ` ｜ 强制原因：${tags}` : "") +
     (it.status === "void" ? `<br><span class="rv-fail">已作废：${it.void_reason}</span>` : "") +
     (it.note ? `<br>备注：${it.note}` : "");
-  document.querySelectorAll("#rvDims input[type=checkbox]").forEach((cb) => {
-    cb.checked = !!(it.dims && it.dims[cb.dataset.dim]); cb.disabled = true;
+  const dims = it.dims || {};
+  document.querySelectorAll("#rvDims .rv-dim-row").forEach((row) => {
+    const key = row.dataset.dim;
+    const radios = row.querySelectorAll("input[type=radio]");
+    radios.forEach((rb) => { rb.disabled = true; rb.checked = false; });
+    if (dims[key] !== undefined && dims[key] !== null) {
+      const sel = row.querySelector(`input[value="${dims[key] ? 1 : 0}"]`);
+      if (sel) sel.checked = true;
+    }
   });
   $("#rvNote").value = it.note || ""; $("#rvNote").disabled = true;
   $("#rvReshoot").checked = !!it.transfer_reshoot; $("#rvReshoot").disabled = true;
@@ -322,6 +362,8 @@ function rvBind() {
   });
   $("#btnRvPass").addEventListener("click", () => rvJudge("pass"));
   $("#btnRvFail").addEventListener("click", () => rvJudge("fail"));
+  document.querySelectorAll("#rvDims input[type=radio]").forEach((rb) =>
+    rb.addEventListener("change", () => { if (rv.mode === "anon") rvSyncJudgeButtons(); }));
   $("#btnRvPassRound").addEventListener("click", () => rvFinish("pass"));
   $("#btnRvExtend").addEventListener("click", rvExtend);
   $("#btnRvReturn").addEventListener("click", () => rvFinish("return"));

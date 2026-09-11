@@ -261,18 +261,23 @@ def _excluded_reviewed_ids(db, reel_id, chain_id):
     return {r["frame_id"] for r in rows if r["frame_id"] is not None}
 
 
-def create_round(db, reel_id, params, parent=None):
-    """创建一轮抽样并锁定版本。parent 给定时为该链的加抽轮。"""
-    if db.one("SELECT id FROM review_rounds WHERE reel_id=? AND status='open'",
-              (reel_id,)):
+def _plan_round(db, reel_id, params, parent=None, check_open=True):
+    """只读规划一轮抽样：确定链、强制集、三段随机结果与版本锁定信息。
+
+    不写库。加抽时先规划、确认有新图可抽，再把上一轮置 failed，避免“已无新图
+    却已把上一轮关闭”导致既不能加抽也不能退回的卡死状态。
+    返回 dict（含 picked、forced_map、pool、chain_id、seq、counts）。
+    """
+    if check_open and db.one(
+            "SELECT id FROM review_rounds WHERE reel_id=? AND status='open'",
+            (reel_id,)):
         raise ValueError("该卷已有复核中的抽查轮次，请先结束（通过/加抽/退回）")
     pool = _sampling_pool(db, reel_id)
     if not pool:
         raise ValueError("卷内没有可抽的有效图像（缺图占位不参与抽样）")
 
     if parent is None:
-        chain_id = None  # 插入后取 id
-        seq = 1
+        chain_id, seq = None, 1
     else:
         if parent["status"] != ST_FAILED:
             raise ValueError("只有未通过的轮次才能发起加抽")
@@ -287,24 +292,51 @@ def create_round(db, reel_id, params, parent=None):
                            params["seed"], forced_ids, exclude)
     picked = {v["frame_id"]: v for v in result["items"]}
     if not picked:
-        raise ValueError("抽样结果为空（可能已无可抽的新帧），请改为退回整卷")
+        # 保持上一轮 open：复核员仍可“退回整卷”，最终处置被完整记录
+        raise ValueError("已无新图可加抽（同链此前均已覆盖）；请退回整卷并写明缘由")
 
+    # 版本锁定信息（仅读取/算 MD5，不写库）
+    locks = {}
+    for fid in picked:
+        f = next(x for x in pool if x["id"] == fid)
+        ver = db.one("SELECT * FROM frame_versions WHERE frame_id=? AND is_current=1",
+                     (fid,))
+        locked_path = ver["stored_path"] if ver and ver["stored_path"] else f["stored_path"]
+        try:
+            locked_md5 = _md5_file(locked_path) if locked_path and os.path.exists(locked_path) else ""
+        except OSError:
+            locked_md5 = ""
+        locks[fid] = {
+            "frame": f,
+            "version_id": ver["id"] if ver else None,
+            "filename": ver["filename"] if ver else f["filename"],
+            "path": locked_path, "rotation": int(f["rotation"] or 0),
+            "md5": locked_md5,
+            "tags": sorted(forced_map.get(fid, set())),
+        }
+    return {"pool": pool, "picked": picked, "locks": locks, "forced_map": forced_map,
+            "chain_id": chain_id, "seq": seq, "counts": result["counts"]}
+
+
+def _insert_round(db, reel_id, params, plan, parent=None):
+    """把规划好的抽样计划落库：建轮次、锁定版本、按种子生成匿名顺序。"""
+    result_counts = plan["counts"]
+    picked, locks = plan["picked"], plan["locks"]
     cur = db.run(
         """INSERT INTO review_rounds(reel_id, parent_id, chain_id, seq, reviewer, seed,
                                      mode, sample_count, sample_ratio, fail_limit, status,
                                      pool_size, n_random, n_forced, n_head, n_middle, n_tail,
                                      created_at)
            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (reel_id, parent["id"] if parent else None, chain_id or 0, seq,
+        (reel_id, parent["id"] if parent else None, plan["chain_id"] or 0, plan["seq"],
          params["reviewer"], params["seed"], params["mode"], params["count"],
-         params["ratio"], params["fail_limit"], ST_OPEN, result["counts"]["pool"],
-         result["counts"]["random"], result["counts"]["forced"],
-         result["counts"]["head"], result["counts"]["middle"], result["counts"]["tail"],
+         params["ratio"], params["fail_limit"], ST_OPEN, result_counts["pool"],
+         result_counts["random"], result_counts["forced"],
+         result_counts["head"], result_counts["middle"], result_counts["tail"],
          time.time()))
     round_id = cur.lastrowid
     if parent is None:
         db.run("UPDATE review_rounds SET chain_id=? WHERE id=?", (round_id, round_id))
-        chain_id = round_id
 
     # 匿名顺序：与帧号无关的种子洗牌
     items_order = sorted(picked.values(), key=lambda v: v["frame_id"])
@@ -314,18 +346,7 @@ def create_round(db, reel_id, params, parent=None):
     now = time.time()
     for idx, v in enumerate(items_order, 1):
         fid = v["frame_id"]
-        f = next(x for x in pool if x["id"] == fid)
-        ver = db.one("SELECT * FROM frame_versions WHERE frame_id=? AND is_current=1",
-                     (fid,))
-        locked_path = ver["stored_path"] if ver and ver["stored_path"] else f["stored_path"]
-        locked_ver = ver["id"] if ver else None
-        locked_name = ver["filename"] if ver else f["filename"]
-        locked_rot = int(f["rotation"] or 0)
-        try:
-            locked_md5 = _md5_file(locked_path) if locked_path and os.path.exists(locked_path) else ""
-        except OSError:
-            locked_md5 = ""
-        tags = sorted(forced_map.get(fid, set()))
+        lk = locks[fid]
         db.run(
             """INSERT INTO review_items(round_id, reel_id, frame_id, anon_index, segment,
                                         selected_by, forced_tags, locked_version_id,
@@ -333,9 +354,16 @@ def create_round(db, reel_id, params, parent=None):
                                         locked_md5, status, created_at)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (round_id, reel_id, fid, idx, v["segment"], v["selected_by"],
-             json.dumps(tags, ensure_ascii=False), locked_ver, locked_name,
-             locked_path, locked_rot, locked_md5, IT_PENDING, now))
+             json.dumps(lk["tags"], ensure_ascii=False), lk["version_id"],
+             lk["filename"], lk["path"], lk["rotation"], lk["md5"], IT_PENDING, now))
     return round_id
+
+
+def create_round(db, reel_id, params, parent=None):
+    """创建一轮抽样并锁定版本。parent 给定时为该链的加抽轮（父轮仍 open 属正常，
+    开放轮次检查由调用方 extend_round 处理）。"""
+    plan = _plan_round(db, reel_id, params, parent=parent, check_open=parent is None)
+    return _insert_round(db, reel_id, params, plan, parent=parent)
 
 
 # ---------------------------------------------------------------- 判定
@@ -372,10 +400,24 @@ def submit_judgement(db, item_id, reviewer, verdict, dims, note, transfer_reshoo
     if not verdict:
         raise ValueError("判定结果无效（pass/fail）")
 
+    # 五项必须逐项明确判定（true=合格，false=不合格）；字段缺失不得默认成 false。
+    dims_in = dims or {}
+    missing = [DIM_LABEL[k] for k in REVIEW_DIMS if k not in dims_in]
+    if missing:
+        raise ValueError("请对 %s 逐项明确判定（合格/不合格）后再提交" % "、".join(missing))
     dim_map = {}
     for k in REVIEW_DIMS:
-        dim_map[k] = 1 if (dims or {}).get(k) else 0
+        v = dims_in[k]
+        if not isinstance(v, bool):
+            raise ValueError("「%s」判定值无效，必须明确选择合格或不合格" % DIM_LABEL[k])
+        dim_map[k] = 1 if v else 0
+    n_bad = sum(1 for v in dim_map.values() if not v)
+
     note = (note or "").strip()[:MAX_REMARKS]
+    if verdict == IT_PASS and n_bad:
+        raise ValueError("有 %d 项判为不合格，不能提交合格判定；请改判不合格并填写备注" % n_bad)
+    if verdict == IT_FAIL and n_bad == 0:
+        raise ValueError("五项均判为合格，不能提交不合格判定")
     if verdict == IT_FAIL and not note:
         raise ValueError("不合格项必须填写备注（问题说明）")
 
@@ -485,7 +527,12 @@ def finish_round(db, round_id, reviewer, action, conclusion=""):
 
 
 def extend_round(db, round_id, reviewer, params):
-    """未通过轮次发起自动加抽：先把上一轮置 failed，再在同链建新一轮。"""
+    """失败数超门限时发起自动加抽，在同链建新一轮。
+
+    关键顺序：先做只读抽样规划（不写库），确认确有新图可抽后，才把上一轮置
+    failed 并落库新一轮。若已无新图，上一轮保持 open——复核员仍可“退回整卷”，
+    最终处置被完整记录，避免轮次卡死。
+    """
     rnd = _round_or_404ish(db, round_id)
     if rnd["status"] != ST_OPEN:
         raise ValueError("只有复核中的轮次可以发起加抽")
@@ -496,14 +543,22 @@ def extend_round(db, round_id, reviewer, params):
         raise ValueError("还有 %d 张未判定，请判定完本轮再加抽" % p["pending"])
     if p["fail"] <= rnd["fail_limit"]:
         raise ValueError("失败数未超过门限，应直接通过而非加抽")
+    # 加抽轮沿用同一复核人
+    params = dict(params)
+    params["reviewer"] = rnd["reviewer"]
+
+    # 1) 只读规划：按“上一轮将成为 failed 父轮”预演（chain/seq 与排除集）
+    pseudo_parent = dict(rnd)
+    pseudo_parent["status"] = ST_FAILED
+    plan = _plan_round(db, rnd["reel_id"], params, parent=pseudo_parent,
+                       check_open=False)
+    # 2) 确认有新图后才关闭上一轮
     db.run("UPDATE review_rounds SET status=?, conclusion=?, decided_at=? WHERE id=?",
            (ST_FAILED, "失败 %d 张超过门限 %d，自动加抽" % (p["fail"], rnd["fail_limit"]),
             time.time(), round_id))
-    # 加抽轮沿用同一复核人；校验通过后强制 reviewer 一致
-    params = dict(params)
-    params["reviewer"] = rnd["reviewer"]
+    # 3) 落库加抽轮（复用规划结果，不再重新抽样，保证与预演一致）
     parent = db.one("SELECT * FROM review_rounds WHERE id=?", (round_id,))
-    return create_round(db, rnd["reel_id"], params, parent=parent)
+    return _insert_round(db, rnd["reel_id"], params, plan, parent=parent)
 
 
 # ---------------------------------------------------------------- 换图作废
@@ -539,20 +594,27 @@ def invalidate_rounds_for_frames(db, reel_id, frame_ids, reason):
 
 
 def _reinstate_item(db, item_id):
-    """撤销换图修订时恢复作废项（仅当锁定版本重新成为当前版本）。"""
+    """撤销换图/朝向修订时恢复作废项（仅当锁定版本与朝向都恢复成抽样时状态）。"""
     it = db.one("SELECT * FROM review_items WHERE id=?", (item_id,))
     if not it or it["status"] != IT_VOID:
         return
+    if not it["frame_id"]:
+        return
     cur = db.one("SELECT id FROM frame_versions WHERE frame_id=? AND is_current=1",
-                 (it["frame_id"],)) if it["frame_id"] else None
-    if cur and cur["id"] == it["locked_version_id"]:
-        # 恢复到作废前的最新判定状态（审阅历史里最后一条）
-        last = db.one(
-            "SELECT verdict FROM review_judgements WHERE item_id=? ORDER BY id DESC LIMIT 1",
-            (item_id,))
-        status = last["verdict"] if last else IT_PENDING
-        db.run("UPDATE review_items SET status=?, void_reason='' WHERE id=?",
-               (status, item_id))
+                 (it["frame_id"],))
+    f = db.one("SELECT rotation FROM frames WHERE id=?", (it["frame_id"],))
+    # 版本行与朝向都必须回到锁定值（朝向调整不换版本行，需单独校验）
+    if not cur or cur["id"] != it["locked_version_id"]:
+        return
+    if f is None or int(f["rotation"] or 0) != int(it["locked_rotation"] or 0):
+        return
+    # 恢复到作废前的最新判定状态（审阅历史里最后一条）
+    last = db.one(
+        "SELECT verdict FROM review_judgements WHERE item_id=? ORDER BY id DESC LIMIT 1",
+        (item_id,))
+    status = last["verdict"] if last else IT_PENDING
+    db.run("UPDATE review_items SET status=?, void_reason='' WHERE id=?",
+           (status, item_id))
 
 
 def undo_invalidate(db, item_ids):

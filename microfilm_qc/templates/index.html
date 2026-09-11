@@ -209,13 +209,33 @@
             <span id="rvIndex" class="hint"></span>
             <button id="btnRvNext">下一张 →</button>
           </div>
-          <div id="rvVoidNote" class="rv-void hidden"></div>
+          <div class="rv-void hidden" id="rvVoidNote"></div>
           <div class="rv-dims" id="rvDims">
-            <label><input type="checkbox" data-dim="clarity"> 清晰度合格</label>
-            <label><input type="checkbox" data-dim="crop"> 裁边合格</label>
-            <label><input type="checkbox" data-dim="orientation"> 朝向正确</label>
-            <label><input type="checkbox" data-dim="blemish"> 无污损</label>
-            <label><input type="checkbox" data-dim="missing"> 无内容缺失</label>
+            <div class="rv-dim-row" data-dim="clarity">
+              <span class="rv-dim-name">清晰度</span>
+              <label class="rv-opt"><input type="radio" name="rv-clarity" value="1"> 合格</label>
+              <label class="rv-opt"><input type="radio" name="rv-clarity" value="0"> 不合格</label>
+            </div>
+            <div class="rv-dim-row" data-dim="crop">
+              <span class="rv-dim-name">裁边</span>
+              <label class="rv-opt"><input type="radio" name="rv-crop" value="1"> 合格</label>
+              <label class="rv-opt"><input type="radio" name="rv-crop" value="0"> 不合格</label>
+            </div>
+            <div class="rv-dim-row" data-dim="orientation">
+              <span class="rv-dim-name">朝向</span>
+              <label class="rv-opt"><input type="radio" name="rv-orientation" value="1"> 合格</label>
+              <label class="rv-opt"><input type="radio" name="rv-orientation" value="0"> 不合格</label>
+            </div>
+            <div class="rv-dim-row" data-dim="blemish">
+              <span class="rv-dim-name">污损</span>
+              <label class="rv-opt"><input type="radio" name="rv-blemish" value="1"> 合格</label>
+              <label class="rv-opt"><input type="radio" name="rv-blemish" value="0"> 不合格</label>
+            </div>
+            <div class="rv-dim-row" data-dim="missing">
+              <span class="rv-dim-name">内容缺失</span>
+              <label class="rv-opt"><input type="radio" name="rv-missing" value="1"> 合格</label>
+              <label class="rv-opt"><input type="radio" name="rv-missing" value="0"> 不合格</label>
+            </div>
           </div>
           <label class="rv-note">问题备注（不合格必填）
             <textarea id="rvNote" rows="3" placeholder="说明不合格现象"></textarea>

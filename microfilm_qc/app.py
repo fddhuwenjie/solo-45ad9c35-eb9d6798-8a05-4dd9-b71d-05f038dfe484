@@ -209,13 +209,22 @@ def finalization_checks_with_review(reel_id):
     return checks
 
 
-def mutate(reel_id, action, fn):
-    """保存修订快照 -> 执行变更 -> 重算连续性。"""
+def mutate(reel_id, action, fn, post=None):
+    """保存修订快照 -> 执行变更 -> 重算连续性。
+
+    post(db, snapshot_extra) 在变更后、返回前执行，可返回要并入修订 extra 的
+    回滚信息（用于二次验收作废的撤销恢复等）。
+    """
     db.save_revision(reel_id, action)
     fn()
     renumber(reel_id)
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     analysis.run_checks(db, reel_id)
+    extra = post() if post else None
+    if extra:
+        db.run("UPDATE revisions SET extra=? WHERE id="
+               "(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
+               (json.dumps(extra, ensure_ascii=False), reel_id))
     return jsonify(state(reel_id))
 
 
@@ -358,16 +367,29 @@ def move(reel_id):
 def rotate(frame_id):
     f = frame_or_404(frame_id)
     deg = int(request.get_json(force=True).get("deg", 90))
+    newrot = (f["rotation"] + deg) % 360
 
     def op():
-        newrot = (f["rotation"] + deg) % 360
         db.run("UPDATE frames SET rotation=? WHERE id=?", (newrot, frame_id))
         if not f["placeholder"]:
             fp = imaging.fingerprint(f["stored_path"], newrot)
             db.run("UPDATE frames SET phash=?, brightness=?, orient_score=? WHERE id=?",
                    (fp["phash"], fp["brightness"], fp["orient_score"], frame_id))
 
-    return mutate(f["reel_id"], "旋转帧 No.%s %d°" % (f["frame_no"], deg), op)
+    def post():
+        # 二次验收：抽样锁定了图像版本的旋转角度；朝向调整即改变受检图像，
+        # 必须把开放轮次中该帧的抽中记录置为 void（历史保留），否则轮次会被
+        # “锁定后朝向被调整”的版本漂移永久卡住、无法通过或重判。
+        extra = {}
+        void_ids = review.invalidate_frame(
+            db, f["reel_id"], frame_id,
+            "抽样锁定后人工调整朝向 %d°（No.%s：%d°→%d°）"
+            % (deg, f["frame_no"], f["rotation"], newrot))
+        if void_ids:
+            extra["review"] = [{"op": "void", "item_id": iid} for iid in void_ids]
+        return extra
+
+    return mutate(f["reel_id"], "旋转帧 No.%s %d°" % (f["frame_no"], deg), op, post=post)
 
 
 @app.route("/api/frame/<int:frame_id>/exclude", methods=["POST"])

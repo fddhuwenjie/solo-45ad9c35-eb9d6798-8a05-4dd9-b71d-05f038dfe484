@@ -373,3 +373,9 @@ button.ghost { background: transparent; }
 .rv-judge button { flex: 1; }
 .rv-done { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
 .rv-finish { display: flex; flex-direction: column; gap: 8px; }
+.rv-dim-row { display: flex; align-items: center; gap: 14px; padding: 5px 6px;
+              border: 1px solid transparent; border-radius: 6px; }
+.rv-dim-row.rv-unset { border-color: var(--border); background: rgba(224,179,76,.07); }
+.rv-dim-name { min-width: 72px; font-size: 13px; }
+.rv-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; }
+.rv-opt input { accent-color: var(--accent); }

@@ -74,11 +74,18 @@ class ReviewTestBase(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         return r.get_json()["round_id"], r.get_json()["detail"]
 
+    ALL_OK = {d: True for d in review.REVIEW_DIMS}
+
     def judge(self, item_id, reviewer, verdict="pass", note="", dims=None,
               transfer=False, expect=200):
+        if dims is None:
+            # 缺省：pass 五项全合格；fail 清晰度不合格，其余合格（五项均明确）
+            dims = dict(self.ALL_OK)
+            if verdict == "fail":
+                dims["clarity"] = False
         r = self.c.post("/api/review-items/%d/judge" % item_id, json={
             "reviewer": reviewer, "verdict": verdict,
-            "dims": dims or {"clarity": True}, "note": note,
+            "dims": dims, "note": note,
             "transfer_reshoot": transfer})
         self.assertEqual(r.status_code, expect, r.get_data(as_text=True))
         return r
@@ -396,10 +403,12 @@ class ReviewFinalizeTests(ReviewTestBase):
     def test_handoff_json_and_csv_content(self):
         self._finalize_ready()
         _rid, d = self.start_round(count=6, seed="HANDOFF", reviewer="乙", fail_limit=1)
-        # 第一张判不合格并备注、转重拍
+        # 第一张判不合格（五项明确，内容缺失项不合格）并备注、转重拍
         audit = self.c.get("/api/reviews/%d/audit" % d["round"]["id"]).get_json()
+        dims = {k: True for k in review.REVIEW_DIMS}
+        dims["missing"] = False
         self.judge(d["items"][0]["id"], "乙", "fail",
-                   note="内容缺失", dims={"missing": True}, transfer=True)
+                   note="内容缺失", dims=dims, transfer=True)
         for it in d["items"][1:]:
             self.judge(it["id"], "乙", "pass")
         self.pass_round(d["round"]["id"], "乙")
@@ -457,6 +466,244 @@ class ReviewFinalizeTests(ReviewTestBase):
         self.assertEqual(r.status_code, 200)
         _rid, d = self.start_round(count=3, seed="LIM")
         self.assertEqual(d["round"]["fail_limit"], 2)
+
+
+# ---------------------------------------------------------------- 回归：五项明确判定
+
+class ExplicitDimsTests(ReviewTestBase):
+    """反例：单张判定提交时五项必须逐项明确，字段缺失不得默认 false 并放行 pass。"""
+
+    def setUp(self):
+        super().setUp()
+        _rid, self.detail = self.start_round(count=3, seed="DIM", reviewer="甲")
+        self.iid = self.detail["items"][0]["id"]
+        self.ok = {k: True for k in review.REVIEW_DIMS}
+
+    def test_missing_all_dims_cannot_pass(self):
+        r = self.c.post("/api/review-items/%d/judge" % self.iid,
+                        json={"reviewer": "甲", "verdict": "pass", "dims": {}})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("逐项明确判定", r.get_json()["error"])
+
+    def test_partial_dims_cannot_pass(self):
+        r = self.c.post("/api/review-items/%d/judge" % self.iid,
+                        json={"reviewer": "甲", "verdict": "pass",
+                              "dims": {"clarity": True}})
+        self.assertEqual(r.status_code, 400)
+        # 必须点出还缺哪些项
+        self.assertIn("裁边", r.get_json()["error"])
+
+    def test_dims_omitted_cannot_pass(self):
+        r = self.c.post("/api/review-items/%d/judge" % self.iid,
+                        json={"reviewer": "甲", "verdict": "pass"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_pass_with_any_false_dim_rejected(self):
+        dims = dict(self.ok)
+        dims["orientation"] = False
+        r = self.c.post("/api/review-items/%d/judge" % self.iid,
+                        json={"reviewer": "甲", "verdict": "pass", "dims": dims})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("不能提交合格判定", r.get_json()["error"])
+
+    def test_fail_with_all_true_rejected(self):
+        r = self.c.post("/api/review-items/%d/judge" % self.iid,
+                        json={"reviewer": "甲", "verdict": "fail",
+                              "dims": self.ok, "note": "其实没问题"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("五项均判为合格", r.get_json()["error"])
+
+    def test_explicit_fail_with_note_accepted(self):
+        dims = dict(self.ok)
+        dims["crop"] = False
+        r = self.c.post("/api/review-items/%d/judge" % self.iid,
+                        json={"reviewer": "甲", "verdict": "fail",
+                              "dims": dims, "note": "左侧裁边"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        d = r.get_json()["detail"]["items"][0]
+        self.assertEqual(d["status"], "fail")
+        self.assertEqual(d["dims"]["crop"], 0)
+        self.assertEqual(d["dims"]["clarity"], 1)
+
+    def test_explicit_all_true_pass_accepted(self):
+        r = self.c.post("/api/review-items/%d/judge" % self.iid,
+                        json={"reviewer": "甲", "verdict": "pass", "dims": self.ok})
+        self.assertEqual(r.status_code, 200)
+
+
+# ---------------------------------------------------------------- 回归：加抽无新图不卡死
+
+class ExtendNoNewFrameTests(ReviewTestBase):
+    """反例：加抽已无新图时，上一轮必须保持可“退回整卷”，最终处置完整记录。"""
+
+    def _full_round_with_one_fail(self, reviewer="甲", seed="FULL"):
+        # 抽满整个总体（count 远大于总体），一张不合格，其余合格
+        r = self.c.post("/api/reels/%d/reviews/start" % self.rid, json={
+            "reviewer": reviewer, "mode": "count", "count": 10_000,
+            "seed": seed, "fail_limit": 0})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        d = r.get_json()["detail"]
+        self.assertEqual(len(d["items"]), d["round"]["pool_size"])
+        ok = {k: True for k in review.REVIEW_DIMS}
+        bad = dict(ok)
+        bad["clarity"] = False
+        for i, it in enumerate(d["items"]):
+            self.judge(it["id"], reviewer,
+                       "fail" if i == 0 else "pass",
+                       note="x" if i == 0 else "",
+                       dims=bad if i == 0 else ok)
+        return d["round"]["id"]
+
+    def test_extend_with_no_new_frame_keeps_round_open(self):
+        rid1 = self._full_round_with_one_fail()
+        r = self.c.post("/api/reviews/%d/extend" % rid1,
+                        json={"mode": "count", "count": 10_000, "seed": "FULL2"})
+        # 不得创建加抽轮，也不得把上一轮关闭
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("已无新图", r.get_json()["error"])
+        cur = self.c.get("/api/reviews/%d" % rid1).get_json()["round"]
+        self.assertEqual(cur["status"], "open")
+        self.assertEqual(cur["decided_at"], 0)
+
+    def test_can_return_whole_reel_after_empty_extend(self):
+        rid1 = self._full_round_with_one_fail()
+        r = self.c.post("/api/reviews/%d/extend" % rid1,
+                        json={"mode": "count", "count": 10_000, "seed": "FULL2"})
+        self.assertEqual(r.status_code, 400)
+        # 仍可退回整卷，最终处置完整记录
+        rr = self.c.post("/api/reviews/%d/finish" % rid1, json={
+            "reviewer": "甲", "action": "return",
+            "conclusion": "无新图可加抽，整卷退回重扫"})
+        self.assertEqual(rr.status_code, 200, rr.get_data(as_text=True))
+        self.assertEqual(rr.get_json()["status"], "returned")
+        cur = self.c.get("/api/reviews/%d" % rid1).get_json()["round"]
+        self.assertEqual(cur["status"], "returned")
+        self.assertIn("整卷退回重扫", cur["conclusion"])
+        self.assertTrue(cur["decided_at"] > 0)
+        # 退回后不能再被判成有效通过
+        self.assertIsNone(review.valid_pass(app.db, self.rid))
+
+    def test_second_extend_chain_when_frames_remain(self):
+        # 首抽少量且一张不合格 -> 加抽一轮；加抽轮再出不合格且仍有新图，可二次加抽
+        ok = {k: True for k in review.REVIEW_DIMS}
+        bad = dict(ok)
+        bad["clarity"] = False
+        r = self.c.post("/api/reels/%d/reviews/start" % self.rid, json={
+            "reviewer": "甲", "mode": "count", "count": 4, "seed": "A1"})
+        d1 = r.get_json()["detail"]
+        r1 = d1["round"]["id"]
+        self.judge(d1["items"][0]["id"], "甲", "fail", note="x", dims=bad)
+        for it in d1["items"][1:]:
+            self.judge(it["id"], "甲", "pass", dims=ok)
+        r2 = self.c.post("/api/reviews/%d/extend" % r1,
+                         json={"mode": "count", "count": 4, "seed": "A2"})
+        self.assertEqual(r2.status_code, 200, r2.get_data(as_text=True))
+        d2 = r2.get_json()["detail"]
+        r2id = d2["round"]["id"]
+        self.assertEqual(d2["round"]["seq"], 2)
+        # 上一轮已关闭为 failed，不再 open
+        self.assertEqual(self.c.get("/api/reviews/%d" % r1).get_json()
+                         ["round"]["status"], "failed")
+        self.judge(d2["items"][0]["id"], "甲", "fail", note="x", dims=bad)
+        for it in d2["items"][1:]:
+            self.judge(it["id"], "甲", "pass", dims=ok)
+        r3 = self.c.post("/api/reviews/%d/extend" % r2id,
+                         json={"mode": "count", "count": 4, "seed": "A3"})
+        self.assertEqual(r3.status_code, 200, r3.get_data(as_text=True))
+        d3 = r3.get_json()["detail"]
+        self.assertEqual(d3["round"]["seq"], 3)
+        self.assertEqual(d3["round"]["chain_id"], d1["round"]["chain_id"])
+        self.assertEqual(d3["round"]["parent_id"], r2id)
+
+
+# ---------------------------------------------------------------- 回归：抽样后旋转朝向
+
+class RotationLockTests(ReviewTestBase):
+    """反例：抽样后调整朝向必须把受影响记录置 void、写缘由、保留历史，
+    且轮次不能被版本漂移永久卡死（可通过其余项后退回/作废重抽）。"""
+
+    def setUp(self):
+        super().setUp()
+        # 大样本确保覆盖目标帧
+        _rid, self.detail = self.start_round(count=36, seed="ROT", reviewer="甲")
+        self.r1 = self.detail["round"]["id"]
+        self.audit = self.c.get("/api/reviews/%d/audit" % self.r1).get_json()
+
+    def _item_for(self, frame_no):
+        return next(i for i in self.audit["items"] if i["frame_no"] == str(frame_no))
+
+    def test_rotate_after_sample_voids_item(self):
+        it = self._item_for(33)
+        self.judge(it["id"], "甲", "pass")
+        f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
+                         (self.rid,))
+        r = self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90})
+        self.assertEqual(r.status_code, 200)
+        row = app.db.one("SELECT * FROM review_items WHERE id=?", (it["id"],))
+        self.assertEqual(row["status"], "void")
+        self.assertIn("调整朝向", row["void_reason"])
+        # 审阅历史保留
+        n = app.db.one("SELECT COUNT(*) c FROM review_judgements WHERE item_id=?",
+                       (it["id"],))["c"]
+        self.assertEqual(n, 1)
+        # 作废项不能继续判
+        r = self.judge(it["id"], "甲", "pass", expect=400)
+        self.assertIn("作废", r.get_json()["error"])
+
+    def test_voided_by_rotation_excluded_from_drift_round_can_finish(self):
+        # 旋转一张后作废，其余全部合格：轮次可以正常给出结论而不是被漂移卡死
+        it_void = self._item_for(33)
+        self.judge(it_void["id"], "甲", "pass")
+        f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
+                         (self.rid,))
+        self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90})
+        cur = self.c.get("/api/reviews/%d" % self.r1).get_json()
+        for it in cur["items"]:
+            if it["status"] == "pending":
+                self.judge(it["id"], "甲", "pass")
+        # 无失败项（作废项不计），门限 0 下可以通过
+        r = self.c.post("/api/reviews/%d/finish" % self.r1,
+                        json={"reviewer": "甲", "action": "pass"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()["status"], "passed")
+
+    def test_undo_rotation_reinstates_when_rotation_restored(self):
+        it = self._item_for(33)
+        self.judge(it["id"], "甲", "pass")
+        f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
+                         (self.rid,))
+        self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90})
+        self.assertEqual(
+            app.db.one("SELECT status FROM review_items WHERE id=?",
+                       (it["id"],))["status"], "void")
+        # 撤销旋转：锁定朝向恢复 -> 作废项恢复到作废前判定
+        r = self.c.post("/api/reels/%d/undo" % self.rid)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            app.db.one("SELECT status FROM review_items WHERE id=?",
+                       (it["id"],))["status"], "pass")
+
+    def test_rotate_unsampled_frame_does_not_void(self):
+        # 36/37 中唯一未被抽中的帧旋转不应产生作废记录
+        sampled_fids = {i["frame_id"] for i in self.audit["items"]}
+        unsampled = next(f for f in self.state()["frames"]
+                         if not f["placeholder"] and f["id"] not in sampled_fids)
+        before = app.db.one("SELECT COUNT(*) c FROM review_items WHERE status='void'")["c"]
+        self.c.post("/api/frame/%d/rotate" % unsampled["id"], json={"deg": 90})
+        after = app.db.one("SELECT COUNT(*) c FROM review_items WHERE status='void'")["c"]
+        self.assertEqual(before, after)
+
+    def test_locked_anonymous_image_keeps_original_rotation(self):
+        # 即使帧当前朝向被改，匿名审片图仍返回锁定时的旋转角度
+        it = self._item_for(33)
+        locked = self.c.get("/api/review-items/%d/image" % it["id"])
+        self.assertEqual(locked.status_code, 200)
+        f33 = app.db.one("SELECT id FROM frames WHERE reel_id=? AND frame_no='33'",
+                         (self.rid,))
+        self.c.post("/api/frame/%d/rotate" % f33["id"], json={"deg": 90})
+        still = self.c.get("/api/review-items/%d/image" % it["id"])
+        self.assertEqual(still.status_code, 200)
+        self.assertEqual(locked.data, still.data)
 
 
 if __name__ == "__main__":
