@@ -134,6 +134,76 @@ CREATE TABLE IF NOT EXISTS frame_sources (
 CREATE INDEX IF NOT EXISTS idx_bops_reel ON boundary_ops(reel_id, id);
 CREATE INDEX IF NOT EXISTS idx_fsrc_frame ON frame_sources(frame_id);
 CREATE INDEX IF NOT EXISTS idx_fsrc_reel ON frame_sources(reel_id);
+
+-- 二次验收：一轮可复现抽样 + 匿名逐张复核。轮次链（parent_id）记录“加抽”关系。
+CREATE TABLE IF NOT EXISTS review_rounds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reel_id INTEGER NOT NULL REFERENCES reels(id) ON DELETE CASCADE,
+    parent_id INTEGER REFERENCES review_rounds(id) ON DELETE SET NULL,
+    chain_id INTEGER NOT NULL,               -- 同一链（首抽/各次加抽共享）
+    seq INTEGER NOT NULL DEFAULT 1,          -- 链内序号：1=首抽，2..=第 n 次加抽
+    reviewer TEXT NOT NULL DEFAULT '',
+    seed TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT 'count',      -- count / ratio
+    sample_count INTEGER NOT NULL DEFAULT 0,-- 随机抽取目标数（不含强制加入项）
+    sample_ratio REAL NOT NULL DEFAULT 0,    -- mode=ratio 时的占比（0-1）
+    fail_limit INTEGER NOT NULL DEFAULT 0,   -- 可配置失败门限（失败数 <= 门限方可通过）
+    status TEXT NOT NULL DEFAULT 'open',     -- open / passed / failed / returned
+    pool_size INTEGER NOT NULL DEFAULT 0,    -- 抽样总体（非占位、非剔除）
+    n_random INTEGER NOT NULL DEFAULT 0,     -- 随机实际命中数
+    n_forced INTEGER NOT NULL DEFAULT 0,     -- 强制加入项数（去重后）
+    n_head INTEGER NOT NULL DEFAULT 0,
+    n_middle INTEGER NOT NULL DEFAULT 0,
+    n_tail INTEGER NOT NULL DEFAULT 0,
+    void_reason TEXT DEFAULT '',             -- 整轮作废原因（换图等）；结论与审阅历史保留
+    conclusion TEXT DEFAULT '',              -- 结束结论说明（通过/加抽/退回时写入）
+    created_at REAL NOT NULL,
+    decided_at REAL NOT NULL DEFAULT 0
+);
+-- 抽中的图像项：版本在抽样时锁定（locked_version_id / path / rotation / md5）。
+-- status: pending/pass/fail/void；审阅历史存 review_judgements，行本身只反映最新判定。
+CREATE TABLE IF NOT EXISTS review_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id INTEGER NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+    reel_id INTEGER NOT NULL REFERENCES reels(id) ON DELETE CASCADE,
+    frame_id INTEGER,                        -- 帧被删除（合并撤销前悬空期）时可空
+    anon_index INTEGER NOT NULL,             -- 匿名审片顺序（种子洗牌，与帧号无关）
+    segment TEXT NOT NULL DEFAULT '',        -- head / middle / tail / forced
+    selected_by TEXT NOT NULL DEFAULT '',    -- random / forced / both
+    forced_tags TEXT DEFAULT '',             -- 强制加入原因标签 JSON：reshoot/fill/split/reg_force...
+    locked_version_id INTEGER,
+    locked_filename TEXT DEFAULT '',
+    locked_path TEXT DEFAULT '',
+    locked_rotation INTEGER NOT NULL DEFAULT 0,
+    locked_md5 TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending / pass / fail / void
+    dims TEXT DEFAULT '',                    -- JSON：五项判定 clarity/crop/orient/blemish/missing
+    note TEXT DEFAULT '',                    -- 不合格备注（fail 必填）
+    transfer_reshoot INTEGER NOT NULL DEFAULT 0,  -- 判定同时转入重拍
+    void_reason TEXT DEFAULT '',
+    decided_at REAL NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+-- 审阅历史：只增不改不覆盖（同一项可留下多条，作废后重判另开轮次）。
+CREATE TABLE IF NOT EXISTS review_judgements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id INTEGER NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES review_items(id) ON DELETE CASCADE,
+    reviewer TEXT NOT NULL DEFAULT '',
+    verdict TEXT NOT NULL DEFAULT '',        -- pass / fail
+    dims TEXT DEFAULT '',
+    note TEXT DEFAULT '',
+    transfer_reshoot INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS qc_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rrounds_reel ON review_rounds(reel_id, id);
+CREATE INDEX IF NOT EXISTS idx_ritems_round ON review_items(round_id, anon_index);
+CREATE INDEX IF NOT EXISTS idx_ritems_frame ON review_items(frame_id);
+CREATE INDEX IF NOT EXISTS idx_rjudge_item ON review_judgements(item_id, id);
 """
 
 FRAME_COLS = ["id", "position", "frame_no", "filename", "stored_path", "note",
@@ -307,3 +377,14 @@ class DB:
             """SELECT fs.* FROM frame_sources fs
                WHERE fs.id IN (SELECT MAX(id) FROM frame_sources WHERE reel_id=? GROUP BY frame_id)""",
             (reel_id,))
+
+    # ---- 质检参数 ----
+    def get_setting(self, key, default=None):
+        r = self.one("SELECT value FROM qc_settings WHERE key=?", (key,))
+        return r["value"] if r else default
+
+    def set_setting(self, key, value):
+        self.run(
+            """INSERT INTO qc_settings(key, value) VALUES(?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, str(value)))

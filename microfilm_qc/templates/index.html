@@ -153,11 +153,96 @@
     </div>
     <div id="rbItems" class="rb-items"></div>
   </section>
+
+  <section class="panel review-panel">
+    <div class="rescan-head">
+      <h3>🔎 二次验收（抽查复核） <span id="rvRoundCount" class="badge gray"></span></h3>
+      <div class="rescan-actions">
+        <button id="btnRvStart" class="primary">发起抽样</button>
+        <button id="btnRvHandoffJson">移交 JSON</button>
+        <button id="btnRvHandoffCsv">移交 CSV</button>
+      </div>
+    </div>
+    <p class="hint">复核员设定抽取数量或占比，系统用可复现种子分别在首段/中段/末段均衡随机抽样，
+      并强制纳入曾经重拍、回填、拆分/合并或人工越过配准门槛的图像；去重后排除缺帧占位。
+      抽样开始即锁定图像版本，进入匿名审片界面逐张判定清晰度、裁边、朝向、污损与内容缺失。</p>
+
+    <div id="rvStartForm" class="rv-form hidden">
+      <div class="import-grid">
+        <label>复核人<input type="text" id="rvReviewer" placeholder="姓名 / 工号"></label>
+        <label>抽样方式
+          <select id="rvMode">
+            <option value="count">按数量</option>
+            <option value="ratio">按占比</option>
+          </select>
+        </label>
+        <label>抽取数量（张，不含强制项）<input type="number" id="rvCount" value="9" min="1"></label>
+        <label>抽取占比（0-1）<input type="number" id="rvRatio" value="0.2" min="0.01" max="1" step="0.05" disabled></label>
+        <label>随机种子（留空自动生成）<input type="text" id="rvSeed" placeholder="可复现"></label>
+        <label>失败门限（超过则不通过）<input type="number" id="rvFailLimit" min="0" value="0"></label>
+        <button id="btnRvDoStart" class="primary">开始抽样并锁定版本</button>
+      </div>
+      <div class="rv-default">
+        <label class="hint">默认失败门限：<input type="number" id="rvDefaultLimit" min="0" style="width:80px">
+          <button id="btnRvSaveLimit" class="ghost">保存默认</button></label>
+      </div>
+    </div>
+
+    <div id="rvRounds" class="rv-rounds"></div>
+  </section>
+
+  <div id="rvModal" class="bd-modal hidden">
+    <div class="bd-modal-box rv-box">
+      <div class="bd-modal-head">
+        <h3>🕶 匿名审片 <span id="rvProgress" class="badge gray"></span></h3>
+        <span class="spacer"></span>
+        <span id="rvRoundMeta" class="hint"></span>
+        <button id="btnRvClose" class="danger ghost">✕</button>
+      </div>
+      <div class="rv-body">
+        <div class="rv-stage">
+          <img id="rvImage" alt="待复核图像">
+        </div>
+        <div class="rv-side">
+          <div class="rv-nav">
+            <button id="btnRvPrev">← 上一张</button>
+            <span id="rvIndex" class="hint"></span>
+            <button id="btnRvNext">下一张 →</button>
+          </div>
+          <div id="rvVoidNote" class="rv-void hidden"></div>
+          <div class="rv-dims" id="rvDims">
+            <label><input type="checkbox" data-dim="clarity"> 清晰度合格</label>
+            <label><input type="checkbox" data-dim="crop"> 裁边合格</label>
+            <label><input type="checkbox" data-dim="orientation"> 朝向正确</label>
+            <label><input type="checkbox" data-dim="blemish"> 无污损</label>
+            <label><input type="checkbox" data-dim="missing"> 无内容缺失</label>
+          </div>
+          <label class="rv-note">问题备注（不合格必填）
+            <textarea id="rvNote" rows="3" placeholder="说明不合格现象"></textarea>
+          </label>
+          <label class="rv-reshoot"><input type="checkbox" id="rvReshoot"> 同时转入重拍清单</label>
+          <div class="rv-judge">
+            <button id="btnRvFail" class="danger">判定不合格</button>
+            <button id="btnRvPass" class="primary">判定合格</button>
+          </div>
+          <div id="rvDone" class="rv-done hidden">
+            <div id="rvDoneStat" class="hint"></div>
+            <div class="rv-finish">
+              <button id="btnRvPassRound" class="primary">通过本轮</button>
+              <button id="btnRvExtend">自动加抽</button>
+              <button id="btnRvReturn" class="danger">退回整卷</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 </main>
 
 <input type="file" id="hiddenFile" class="hidden">
 <script src="/static/app.js"></script>
 <script src="/static/rescan.js"></script>
 <script src="/static/boundary.js"></script>
+<script src="/static/review.js"></script>
 </body>
 </html>

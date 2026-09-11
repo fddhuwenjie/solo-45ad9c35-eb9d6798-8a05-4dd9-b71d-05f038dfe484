@@ -79,6 +79,7 @@ function renderAll() {
   renderDetail();
   renderChecks();
   $("#btnUndo").disabled = !state.data.can_undo;
+  if (window.rvRender) window.rvRender();
 }
 window.renderAll = renderAll;
 

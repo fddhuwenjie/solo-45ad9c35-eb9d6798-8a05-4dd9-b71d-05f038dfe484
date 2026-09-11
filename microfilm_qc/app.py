@@ -10,7 +10,7 @@ import zipfile
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
 from qc_core.db import DB
-from qc_core import analysis, boundary, imaging, rescan, sample_reel
+from qc_core import analysis, boundary, imaging, rescan, review, sample_reel
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
@@ -191,8 +191,22 @@ def state(reel_id):
         "can_undo": len(db.revisions(reel_id)) > 0,
         "rescan_batches": rescan.list_batches(db, reel_id),
         "boundary_ops": boundary.ops_list(db, reel_id),
-        "checks": analysis.finalization_checks(db, reel_id),
+        "checks": finalization_checks_with_review(reel_id),
+        "review": review.review_summary(db, reel_id),
     }
+
+
+def finalization_checks_with_review(reel_id):
+    """定稿检查 + 二次验收通过结论门禁（state 与 finalize 共用）。"""
+    checks = analysis.finalization_checks(db, reel_id)
+    vp = review.valid_pass(db, reel_id)
+    review_check = {"key": "review", "ok": vp is not None, "label": "二次验收",
+                    "detail": ("已关联第 %d 轮通过结论（种子 %s，复核人 %s）"
+                               % (vp["seq"], vp["seed"], vp["reviewer"])) if vp
+                    else "缺少有效的二次验收通过结论，请完成抽查复核"}
+    checks["checks"].append(review_check)
+    checks["passed"] = checks["passed"] and review_check["ok"]
+    return checks
 
 
 def mutate(reel_id, action, fn):
@@ -289,6 +303,10 @@ def delete_reel(reel_id):
     db.run("DELETE FROM boundary_ops WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM frames WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM rescan_batches WHERE reel_id=?", (reel_id,))
+    db.run("DELETE FROM review_judgements WHERE round_id IN "
+           "(SELECT id FROM review_rounds WHERE reel_id=?)", (reel_id,))
+    db.run("DELETE FROM review_items WHERE reel_id=?", (reel_id,))
+    db.run("DELETE FROM review_rounds WHERE reel_id=?", (reel_id,))
     db.run("DELETE FROM reels WHERE id=?", (reel_id,))
     return jsonify({"ok": True})
 
@@ -503,9 +521,21 @@ def boundary_split(frame_id):
         raise
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     _boundary_recheck(reel_id, outputs, extra["boundary"])
+    # 二次验收：拆分就地更换了锚点/填充帧图像；新增片段此前不可能被抽中
+    affected = [frame_id] + extra["boundary"].get("filled_placeholders", [])
+    _void_review_for_extra(reel_id, affected,
+                           "帧边界拆分换图（操作 #%s）" % op_id, rev_id, extra)
+    return jsonify({"op_id": op_id, "outputs": outputs, "state": state(reel_id)})
+
+
+def _void_review_for_extra(reel_id, affected_frame_ids, reason, rev_id, extra):
+    """作废开放轮次中受换图影响的抽中项，并把回滚信息并入修订 extra。"""
+    void_ids = review.invalidate_rounds_for_frames(db, reel_id, affected_frame_ids, reason)
+    if void_ids:
+        extra["review"] = [{"op": "void", "item_id": iid}
+                           for iid in dict.fromkeys(void_ids)]
     db.run("UPDATE revisions SET extra=? WHERE id=?",
            (json.dumps(extra, ensure_ascii=False), rev_id))
-    return jsonify({"op_id": op_id, "outputs": outputs, "state": state(reel_id)})
 
 
 @app.route("/api/reels/<int:reel_id>/boundary/merge", methods=["POST"])
@@ -535,8 +565,10 @@ def boundary_merge(reel_id):
         return jsonify({"error": str(ex), "state": state(reel_id)}), 400
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     _boundary_recheck(reel_id, outputs, extra["boundary"])
-    db.run("UPDATE revisions SET extra=? WHERE id=?",
-           (json.dumps(extra, ensure_ascii=False), rev_id))
+    # 二次验收：合并后锚点帧图像被拼接结果替换；被删帧在其悬空期也按受影响处理
+    affected = frame_ids
+    _void_review_for_extra(reel_id, affected,
+                           "帧边界合并换图（操作 #%s）" % op_id, rev_id, extra)
     return jsonify({"op_id": op_id, "outputs": outputs, "state": state(reel_id)})
 
 
@@ -601,6 +633,9 @@ def undo(reel_id):
     if result.get("extra"):
         rollback_rescan(result["extra"])
         boundary.rollback(db, result["extra"])
+        review.undo_invalidate(
+            db, [op.get("item_id") for op in result["extra"].get("review", [])
+                 if op.get("op") == "void"])
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     analysis.run_checks(db, reel_id)
     return jsonify({"undone": result["action"], "state": state(reel_id)})
@@ -609,11 +644,150 @@ def undo(reel_id):
 @app.route("/api/reels/<int:reel_id>/finalize", methods=["POST"])
 def finalize(reel_id):
     reel_or_404(reel_id)
-    checks = analysis.finalization_checks(db, reel_id)
+    checks = finalization_checks_with_review(reel_id)
     if not checks["passed"]:
         return jsonify({"error": "定稿检查未通过", "checks": checks, "state": state(reel_id)}), 400
     db.run("UPDATE reels SET finalized=1 WHERE id=?", (reel_id,))
     return jsonify(state(reel_id))
+
+
+# ---------------------------------------------------------------- 二次验收（抽查复核）
+
+@app.route("/api/reels/<int:reel_id>/reviews/settings", methods=["POST"])
+def review_set_default_limit(reel_id):
+    reel_or_404(reel_id)
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        limit = int(body.get("fail_limit", 0))
+    except (TypeError, ValueError):
+        abort(400, "默认失败门限必须是非负整数")
+    if limit < 0:
+        abort(400, "默认失败门限不能为负")
+    db.set_setting(review.SETTING_FAIL_LIMIT, limit)
+    return jsonify(state(reel_id))
+
+
+@app.route("/api/reels/<int:reel_id>/reviews/start", methods=["POST"])
+def review_start(reel_id):
+    reel_or_404(reel_id)
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        params = review.validate_params(db, body)
+        round_id = review.create_round(db, reel_id, params)
+    except ValueError as ex:
+        return jsonify({"error": str(ex), "state": state(reel_id)}), 400
+    db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
+    return jsonify({"round_id": round_id,
+                    "detail": review.round_detail(db, round_id),
+                    "state": state(reel_id)})
+
+
+@app.route("/api/reviews/<int:round_id>")
+def review_detail(round_id):
+    r = db.one("SELECT * FROM review_rounds WHERE id=?", (round_id,))
+    if not r:
+        abort(404, "抽查轮次不存在")
+    include_audit = bool(request.args.get("audit"))
+    return jsonify(review.round_detail(db, round_id, include_audit=include_audit))
+
+
+@app.route("/api/review-items/<int:item_id>/image")
+def review_item_image(item_id):
+    """匿名审片图像：始终返回抽样时锁定的版本与旋转，路径/帧号不出现在页面上。"""
+    it = db.one("SELECT * FROM review_items WHERE id=?", (item_id,))
+    if not it:
+        abort(404, "抽查项不存在")
+    path = it["locked_path"]
+    if not path or not os.path.exists(path):
+        abort(404, "锁定图像文件已不可读")
+    w = max(200, min(2400, int(request.args.get("w", 1000))))
+    data = imaging.make_thumb(path, it["locked_rotation"], w)
+    return send_file(io.BytesIO(data), mimetype="image/jpeg")
+
+
+@app.route("/api/review-items/<int:item_id>/judge", methods=["POST"])
+def review_judge(item_id):
+    it = db.one("SELECT * FROM review_items WHERE id=?", (item_id,))
+    if not it:
+        abort(404, "抽查项不存在")
+    body = request.get_json(force=True, silent=True) or {}
+    reviewer = str(body.get("reviewer", "") or "")
+    try:
+        review.submit_judgement(
+            db, item_id, reviewer, str(body.get("verdict", "")),
+            body.get("dims") or {}, str(body.get("note", "") or ""),
+            bool(body.get("transfer_reshoot")))
+    except ValueError as ex:
+        return jsonify({"error": str(ex)}), 400
+    return jsonify({"detail": review.round_detail(db, it["round_id"])})
+
+
+@app.route("/api/reviews/<int:round_id>/finish", methods=["POST"])
+def review_finish(round_id):
+    r = db.one("SELECT * FROM review_rounds WHERE id=?", (round_id,))
+    if not r:
+        abort(404, "抽查轮次不存在")
+    body = request.get_json(force=True, silent=True) or {}
+    action = str(body.get("action", "") or "")
+    try:
+        status, progress = review.finish_round(
+            db, round_id, str(body.get("reviewer", "") or ""), action,
+            str(body.get("conclusion", "") or ""))
+    except ValueError as ex:
+        return jsonify({"error": str(ex),
+                        "detail": review.round_detail(db, round_id)}), 400
+    db.run("UPDATE reels SET finalized=0 WHERE id=?", (r["reel_id"],))
+    return jsonify({"status": status, "progress": progress,
+                    "detail": review.round_detail(db, round_id),
+                    "state": state(r["reel_id"])})
+
+
+@app.route("/api/reviews/<int:round_id>/extend", methods=["POST"])
+def review_extend(round_id):
+    r = db.one("SELECT * FROM review_rounds WHERE id=?", (round_id,))
+    if not r:
+        abort(404, "抽查轮次不存在")
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        # 沿用本轮复核人；新数量/占比/种子/门限由表单给（可复现）
+        params = review.validate_params(db, dict(body, reviewer=r["reviewer"]))
+        new_id = review.extend_round(db, round_id, r["reviewer"], params)
+    except ValueError as ex:
+        return jsonify({"error": str(ex),
+                        "detail": review.round_detail(db, round_id),
+                        "state": state(r["reel_id"])}), 400
+    db.run("UPDATE reels SET finalized=0 WHERE id=?", (r["reel_id"],))
+    return jsonify({"round_id": new_id,
+                    "detail": review.round_detail(db, new_id),
+                    "state": state(r["reel_id"])})
+
+
+@app.route("/api/reviews/<int:round_id>/audit")
+def review_audit(round_id):
+    """非匿名审计视图：暴露帧号/文件/强制标签/审阅历史（管理与移交证据用）。"""
+    r = db.one("SELECT * FROM review_rounds WHERE id=?", (round_id,))
+    if not r:
+        abort(404, "抽查轮次不存在")
+    return jsonify(review.round_detail(db, round_id, include_audit=True))
+
+
+@app.route("/api/reels/<int:reel_id>/reviews/handoff.<fmt>")
+def review_handoff(reel_id, fmt):
+    """定稿移交：JSON/CSV 写入方案参数、种子、复核人、作废缘由和最终处置。"""
+    reel = reel_or_404(reel_id)
+    vp = review.valid_pass(db, reel_id)
+    if not vp:
+        abort(400, "没有有效的二次验收通过结论，不能生成移交文件")
+    if fmt == "json":
+        payload = review.handoff_payload(db, reel)
+        buf = io.BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+        return send_file(buf, mimetype="application/json", as_attachment=True,
+                         download_name="%s_review_handoff.json" % reel["reel_no"])
+    if fmt == "csv":
+        data = review.handoff_csv(db, reel)
+        return send_file(io.BytesIO(data), mimetype="text/csv", as_attachment=True,
+                         download_name="%s_review_handoff.csv" % reel["reel_no"])
+    abort(404, "仅支持 .json / .csv")
 
 
 # ---------------------------------------------------------------- 补扫回填
@@ -680,6 +854,12 @@ def rescan_accept(item_id):
                         "detail": rescan.batch_detail(db, it["batch_id"])}), 400
     db.run("UPDATE reels SET finalized=0 WHERE id=?", (reel_id,))
     analysis.recheck(db, reel_id, [frame_id])
+    # 二次验收：补扫回填更换了当前有效图，开放轮次中该帧的抽中记录作废（历史保留）
+    void_ids = review.invalidate_frame(
+        db, reel_id, frame_id, "补扫回填换图（补扫批次 #%s）" % item_id)
+    if void_ids:
+        extra.setdefault("review", []).extend(
+            {"op": "void", "item_id": iid} for iid in void_ids)
     # 把补扫回滚信息并入刚保存的修订
     db.run("UPDATE revisions SET extra=? WHERE id=(SELECT MAX(id) FROM revisions WHERE reel_id=?)",
            (json.dumps(extra, ensure_ascii=False), reel_id))
